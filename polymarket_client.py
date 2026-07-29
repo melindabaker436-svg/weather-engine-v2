@@ -10,6 +10,7 @@ import json
 import re
 import datetime as dt
 import requests
+import time
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
@@ -64,6 +65,8 @@ def parse_bucket_label(label: str):
     Returns (low, high). low/high are None for open-ended tails. For a
     single-degree bucket "N", returns (N-0.5, N+0.5).
     """
+    if not label:
+        return None
     m = _OR_BELOW_RE.search(label)
     if m:
         val = float(m.group(1))
@@ -89,21 +92,36 @@ def get_market_buckets(event: dict) -> list:
             outcomes = json.loads(market.get("outcomes", "[]"))
             prices = json.loads(market.get("outcomePrices", "[]"))
             token_ids = json.loads(market.get("clobTokenIds", "[]"))
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"  [pm] skipped market: json decode error: {e}")
             continue
         if not outcomes or not prices:
+            print(f"  [pm] skipped market: no outcomes/prices, groupTitle={market.get('groupItemTitle')!r}")
             continue
-        label = market.get("question", market.get("groupItemTitle", ""))
+        label = market.get("question", market.get("groupItemTitle", "")).strip()
         try:
             price = float(prices[0])
-        except (ValueError, IndexError):
+        except (ValueError, IndexError) as e:
+            print(f"  [pm] skipped market: price parse failed for label={label!r}, prices={prices!r}: {e}")
             continue
         parsed = parse_bucket_label(label)
         if parsed is None:
+            print(f"  [pm] skipped market: label parse failed: {label!r}")
             continue
         low, high = parsed
         token_id = token_ids[0] if token_ids else None
-        buckets.append({"label": label, "price": price, "token_id": token_id, "low": low, "high": high})
+        if not token_id:
+            print(f"  [pm] market has no token_id (will have no book): label={label!r}")
+        # clamp price to [0,1]
+        price = max(0.0, min(1.0, price))
+        buckets.append({
+            "label": label,
+            "price": price,
+            "token_id": token_id,
+            "low": low,
+            "high": high,
+            "raw_market": market,
+        })
     return buckets
 
 
@@ -115,7 +133,12 @@ def get_order_book(token_id: str, timeout: int = 10) -> dict:
 
 def get_spread_and_depth(token_id: str, needed_usd: float = 30.0, max_slippage_pct: float = 3.0):
     """Returns (spread_cents, depth_ok). Returns (None, False) on empty/missing book --
-    never silently defaults to a fake wide spread like the old buggy version did."""
+    never silently defaults to a fake wide spread like the old buggy version did.
+
+    Adds defensive normalization: if the order-book prices appear to be on a 0..100
+    scale instead of 0..1, we normalize them. Also prints raw best_bid/best_ask for
+    suspicious spreads to aid diagnosis.
+    """
     if not token_id:
         return None, False
     try:
@@ -126,16 +149,49 @@ def get_spread_and_depth(token_id: str, needed_usd: float = 30.0, max_slippage_p
     if not bids or not asks:
         return None, False
 
-    best_bid, best_ask = float(bids[0]["price"]), float(asks[0]["price"])
+    try:
+        raw_best_bid = float(bids[0]["price"])
+        raw_best_ask = float(asks[0]["price"])
+    except Exception:
+        return None, False
+
+    # Detect likely scale mismatch: if the ask price is > 2, assume book uses 0..100 scale
+    scale = 1.0
+    if raw_best_ask > 2.0:
+        scale = 100.0
+
+    # Normalize bids/asks
+    bids_norm = []
+    asks_norm = []
+    for level in bids:
+        try:
+            bids_norm.append({"price": float(level["price"]) / scale, "size": float(level.get("size", 0.0))})
+        except Exception:
+            continue
+    for level in asks:
+        try:
+            asks_norm.append({"price": float(level["price"]) / scale, "size": float(level.get("size", 0.0))})
+        except Exception:
+            continue
+
+    if not bids_norm or not asks_norm:
+        return None, False
+
+    best_bid = bids_norm[0]["price"]
+    best_ask = asks_norm[0]["price"]
     spread_cents = round((best_ask - best_bid) * 100, 2)
+
+    # If spread is suspiciously large, print the raw and normalized best bid/ask to help debug
+    if spread_cents > 50.0:
+        print(f"  [pm-debug] token_id={token_id} raw_best_bid={raw_best_bid} raw_best_ask={raw_best_ask} scale={scale} norm_best_bid={best_bid} norm_best_ask={best_ask} spread_cents={spread_cents}")
 
     max_price = best_ask * (1 + max_slippage_pct / 100)
     filled = 0.0
-    for level in asks:
-        price = float(level["price"])
+    for level in asks_norm:
+        price = level["price"]
         if price > max_price:
             break
-        filled += price * float(level["size"])
+        filled += price * level.get("size", 0.0)
         if filled >= needed_usd:
             break
     depth_ok = filled >= needed_usd
