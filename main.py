@@ -132,6 +132,10 @@ def run_check(bias_data: dict, target_date: str = None):
 
         result = se.evaluate_buckets(city, raw_values, city_bias, buckets)
         print(f"  {result.reason_code}: {result.detail}")
+        if result.all_candidates:
+            print("  Full candidate table (est_prob | market | gap):")
+            for label, p, price, gap in result.all_candidates[:5]:
+                print(f"    {label}: {p:.1%} | {price:.1%} | {gap:+.1f}pp")
 
         if result.signal:
             send_telegram(format_signal_alert(result.signal))
