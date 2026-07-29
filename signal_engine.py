@@ -48,14 +48,10 @@ class EvalResult:
     signal: Optional[Signal]
     reason_code: str
     detail: str
+    all_candidates: list = None  # [(label, est_prob, market_price, gap_pp), ...] full ranked table, for visibility
 
 
 def correct_forecast(raw_model_values: dict, bias_data: dict) -> tuple:
-    """
-    raw_model_values: {model_name: raw_forecast_value}
-    bias_data: {model_name: {"bias": float, "sigma": float, "n": int}} for THIS city
-    Returns (corrected_mu, sigma). corrected_value = raw - bias.
-    """
     corrected_values = []
     sigmas = []
     for model, raw_value in raw_model_values.items():
@@ -89,33 +85,38 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
         candidates.append((b, est_prob, gap_pp))
 
     candidates.sort(key=lambda x: x[2], reverse=True)
+    candidate_table = [(b.label, round(p, 4), b.price, gap) for b, p, gap in candidates]
 
     if not candidates:
-        return EvalResult(None, "no_buckets", "No buckets to evaluate.")
+        return EvalResult(None, "no_buckets", "No buckets to evaluate.", candidate_table)
 
     best_bucket, best_prob, best_gap = candidates[0]
 
     if best_bucket.price < LONGSHOT_FLOOR:
         return EvalResult(None, "longshot_floor",
                            f"Best candidate '{best_bucket.label}' priced at {best_bucket.price:.2f}, "
-                           f"below the {LONGSHOT_FLOOR} longshot floor -- skipped regardless of edge.")
+                           f"below the {LONGSHOT_FLOOR} longshot floor -- skipped regardless of edge. "
+                           f"NOTE: buckets priced near 0.00 are often untraded/stale snapshots, not real "
+                           f"live prices -- check all_candidates for what's happening on liquid buckets.",
+                           candidate_table)
 
     if best_gap > MAX_SANITY_GAP_PP:
         return EvalResult(None, "gap_implausible",
                            f"Gap {best_gap}pp on '{best_bucket.label}' exceeds sanity ceiling "
                            f"{MAX_SANITY_GAP_PP}pp -- likely bad input, not real edge. "
-                           f"(mu={mu:.2f}, sigma={sigma:.2f}, est_prob={best_prob:.1%}, market={best_bucket.price:.1%})")
+                           f"(mu={mu:.2f}, sigma={sigma:.2f}, est_prob={best_prob:.1%}, market={best_bucket.price:.1%})",
+                           candidate_table)
 
     if best_gap < MIN_GAP_PP:
         return EvalResult(None, "gap_too_small",
-                           f"Best gap {best_gap}pp below minimum {MIN_GAP_PP}pp.")
+                           f"Best gap {best_gap}pp below minimum {MIN_GAP_PP}pp.", candidate_table)
 
     if best_bucket.spread_cents is None or best_bucket.spread_cents > MAX_SPREAD_CENTS:
         return EvalResult(None, "liquidity_fail",
                            f"Spread {best_bucket.spread_cents}c on '{best_bucket.label}' exceeds "
-                           f"max {MAX_SPREAD_CENTS}c (or no real book).")
+                           f"max {MAX_SPREAD_CENTS}c (or no real book).", candidate_table)
     if best_bucket.depth_ok is False:
-        return EvalResult(None, "liquidity_fail", f"Insufficient depth on '{best_bucket.label}'.")
+        return EvalResult(None, "liquidity_fail", f"Insufficient depth on '{best_bucket.label}'.", candidate_table)
 
     sig = Signal(
         city=city, bucket_label=best_bucket.label, corrected_mu=round(mu, 2),
@@ -124,4 +125,4 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
     )
     return EvalResult(sig, "fired",
                        f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
-                       f"{best_bucket.price:.1%}, gap {best_gap}pp.")
+                       f"{best_bucket.price:.1%}, gap {best_gap}pp.", candidate_table)
