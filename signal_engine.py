@@ -48,7 +48,7 @@ class EvalResult:
     signal: Optional[Signal]
     reason_code: str
     detail: str
-    all_candidates: list = None  # [(label, est_prob, market_price, gap_pp), ...] full ranked table, for visibility
+    all_candidates: list = None  # [(label, est_prob, market_price, gap_pp, spread_cents, depth_ok, token_id), ...] full ranked table, for visibility
 
 
 def correct_forecast(raw_model_values: dict, bias_data: dict) -> tuple:
@@ -70,6 +70,21 @@ def correct_forecast(raw_model_values: dict, bias_data: dict) -> tuple:
     return mu, sigma
 
 
+def _liquidity_score(spread_cents, depth_ok):
+    # Map spread/depth to a simple liquidity score in [0,1]
+    if depth_ok is False or spread_cents is None:
+        return 0.0
+    try:
+        sc = float(spread_cents)
+    except Exception:
+        return 0.0
+    if sc <= MAX_SPREAD_CENTS:
+        return 1.0
+    if sc <= MAX_SPREAD_CENTS * 5:
+        return 0.5
+    return 0.2
+
+
 def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
                       buckets: list) -> EvalResult:
     mu, sigma = correct_forecast(raw_model_values, bias_data)
@@ -86,31 +101,36 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
             est_prob = 0.0
         est_prob = max(0.0, min(1.0, est_prob))
         gap_pp = round((est_prob - b.price) * 100, 1)
-        candidates.append((b, est_prob, gap_pp))
+        # liquidity-aware adjusted gap: prefer liquid buckets
+        liq = _liquidity_score(b.spread_cents, b.depth_ok)
+        adjusted_gap = round(gap_pp * liq, 3)
+        candidates.append((b, est_prob, gap_pp, adjusted_gap))
 
-    # sort by gap desc (biggest edges first), but we'll iterate and pick the first viable one
-    candidates.sort(key=lambda x: x[2], reverse=True)
+    # sort by adjusted_gap desc (favor liquid, high-edge candidates)
+    candidates.sort(key=lambda x: x[3], reverse=True)
 
-    # include spread/depth in the candidate table for better diagnostics
-    candidate_table = [(b.label, round(p, 4), b.price, gap, b.spread_cents, b.depth_ok) for b, p, gap in candidates]
+    # include spread/depth/token_id in the candidate table for better diagnostics
+    candidate_table = [
+        (b.label, round(p, 4), b.price, gap, b.spread_cents, b.depth_ok, b.token_id, round(adjusted, 4))
+        for b, p, gap, adjusted in candidates
+    ]
 
     if not candidates:
         return EvalResult(None, "no_buckets", "No buckets to evaluate.", candidate_table)
 
     # Event-level stale market detection: if the market looks dead (all tiny prices), skip the event
-    prices = [b.price for b, _, _ in candidates]
+    prices = [b.price for b, _, _, _ in candidates]
     if max(prices) < 0.02 or sum(prices) < 0.05:
         return EvalResult(None, "market_stale_snapshot",
                           "Market prices appear to be a stale snapshot (all buckets tiny/untraded).",
                           candidate_table)
 
-    # Iterate down candidates (by gap) and pick the first that passes all checks
+    # Iterate down candidates (by adjusted gap) and pick the first that passes hard checks
     rejection_reasons = []  # (label, reason, value)
     chosen = None
-    for b, p, gap in candidates:
-        # sanity gap check
+    for b, p, gap, adjusted in candidates:
+        # sanity gap check on raw gap
         if gap > MAX_SANITY_GAP_PP:
-            # If gap is extremely large but price tiny, mark suspicious and continue to next candidate
             rejection_reasons.append((b.label, "gap_implausible", gap))
             continue
 
@@ -119,11 +139,8 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
             rejection_reasons.append((b.label, "below_longshot_floor", b.price))
             continue
 
-        # liquidity checks
-        if b.spread_cents is None or b.spread_cents > MAX_SPREAD_CENTS:
-            rejection_reasons.append((b.label, "spread_too_large", b.spread_cents))
-            continue
-        if b.depth_ok is False:
+        # require some depth; if no depth we skip
+        if b.depth_ok is False or b.depth_ok is None:
             rejection_reasons.append((b.label, "insufficient_depth", b.depth_ok))
             continue
 
@@ -133,7 +150,7 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
             continue
 
         # candidate passes all checks
-        chosen = (b, p, gap)
+        chosen = (b, p, gap, adjusted)
         break
 
     # No viable candidate found -> build a reason
@@ -144,7 +161,7 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
             return EvalResult(None, "longshot_floor",
                               "All candidates below longshot floor. See candidate_table for details.",
                               candidate_table)
-        if any(r in ("spread_too_large", "insufficient_depth") for r in reasons):
+        if any(r in ("insufficient_depth",) for r in reasons):
             return EvalResult(None, "liquidity_fail",
                               "No candidate passed liquidity checks. See candidate_table for details.",
                               candidate_table)
@@ -154,7 +171,7 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
                           candidate_table)
 
     # chosen candidate -> build signal
-    best_bucket, best_prob, best_gap = chosen
+    best_bucket, best_prob, best_gap, best_adjusted = chosen
     sig = Signal(
         city=city, bucket_label=best_bucket.label, corrected_mu=round(mu, 2),
         sigma=round(sigma, 2), est_prob=round(best_prob, 4),
@@ -162,4 +179,5 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
     )
     return EvalResult(sig, "fired",
                       f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
-                      f"{best_bucket.price:.1%}, gap {best_gap}pp.", candidate_table)
+                      f"{best_bucket.price:.1%}, gap {best_gap}pp (adj {best_adjusted}).",
+                      candidate_table)
