@@ -130,8 +130,41 @@ def run_check(bias_data: dict, target_date: str = None):
             print("  Event found but no parseable buckets.")
             continue
 
+        # Evaluate once, then if suspicious tiny prices are detected try a single quick re-fetch
         result = se.evaluate_buckets(city, raw_values, city_bias, buckets)
         print(f"  {result.reason_code}: {result.detail}")
+
+        # If candidate table exists, detect very small market prices that might be stale/untraded
+        def _min_price_from_candidate_table(ct):
+            prices = []
+            if not ct:
+                return None
+            for row in ct:
+                if len(row) > 2 and isinstance(row[2], (int, float)):
+                    prices.append(row[2])
+            return min(prices) if prices else None
+
+        min_price = _min_price_from_candidate_table(result.all_candidates)
+        # Retry conditions: very small min price and we got a stale/longshot/liquidity/no_viable result
+        if min_price is not None and min_price < 0.01 and result.reason_code in (
+                "longshot_floor", "market_stale_snapshot", "no_viable_candidate", "liquidity_fail"):
+            print("  [refetch] Detected very small market prices (<1%), re-fetching market data and retrying once...")
+            try:
+                time.sleep(1)
+                raw_buckets = pm.get_market_buckets(event)
+                buckets = []
+                for rb in raw_buckets:
+                    spread_cents, depth_ok = pm.get_spread_and_depth(rb["token_id"])
+                    buckets.append(se.Bucket(
+                        label=rb["label"], low=rb["low"], high=rb["high"], price=rb["price"],
+                        token_id=rb["token_id"], spread_cents=spread_cents, depth_ok=depth_ok,
+                    ))
+                result_retry = se.evaluate_buckets(city, raw_values, city_bias, buckets)
+                print(f"  Retry -> {result_retry.reason_code}: {result_retry.detail}")
+                result = result_retry
+            except Exception as e:
+                print(f"  [refetch] Retry failed: {e}")
+
         if result.all_candidates:
             print("  Full candidate table (est_prob | market | gap | spread_cents | depth_ok):")
             for row in result.all_candidates[:5]:
