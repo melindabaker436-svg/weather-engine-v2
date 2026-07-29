@@ -86,6 +86,13 @@ def parse_bucket_label(label: str):
 
 
 def get_market_buckets(event: dict) -> list:
+    """Parse an event's markets and return a list of buckets.
+
+    Each market may contain arrays for outcomes, outcomePrices, and clobTokenIds.
+    We iterate by index and create one bucket per outcome so token_ids align with
+    the price/label for that outcome. We also log when array lengths mismatch or
+    when markets are skipped to aid debugging.
+    """
     buckets = []
     for market in event.get("markets", []):
         try:
@@ -95,33 +102,59 @@ def get_market_buckets(event: dict) -> list:
         except (json.JSONDecodeError, TypeError) as e:
             print(f"  [pm] skipped market: json decode error: {e}")
             continue
+
         if not outcomes or not prices:
             print(f"  [pm] skipped market: no outcomes/prices, groupTitle={market.get('groupItemTitle')!r}")
             continue
-        label = market.get("question", market.get("groupItemTitle", "")).strip()
-        try:
-            price = float(prices[0])
-        except (ValueError, IndexError) as e:
-            print(f"  [pm] skipped market: price parse failed for label={label!r}, prices={prices!r}: {e}")
-            continue
-        parsed = parse_bucket_label(label)
-        if parsed is None:
-            print(f"  [pm] skipped market: label parse failed: {label!r}")
-            continue
-        low, high = parsed
-        token_id = token_ids[0] if token_ids else None
-        if not token_id:
-            print(f"  [pm] market has no token_id (will have no book): label={label!r}")
-        # clamp price to [0,1]
-        price = max(0.0, min(1.0, price))
-        buckets.append({
-            "label": label,
-            "price": price,
-            "token_id": token_id,
-            "low": low,
-            "high": high,
-            "raw_market": market,
-        })
+
+        # Log mismatched array lengths so we can debug mapping issues
+        n_out = len(outcomes)
+        n_prices = len(prices)
+        n_tokens = len(token_ids) if token_ids else 0
+        if n_out != n_prices or (token_ids and n_out != n_tokens):
+            print(f"  [pm] market array length mismatch market_id={market.get('id')} outcomes={n_out} prices={n_prices} token_ids={n_tokens}")
+
+        for i, outcome in enumerate(outcomes):
+            # outcome may be a label string or a dict depending on API; coerce to string when possible
+            outcome_label = None
+            if isinstance(outcome, dict):
+                outcome_label = outcome.get("label") or outcome.get("title") or str(outcome)
+            else:
+                outcome_label = str(outcome)
+
+            try:
+                price = float(prices[i])
+            except (ValueError, IndexError) as e:
+                print(f"  [pm] skipped outcome index {i}: price parse failed, prices={prices!r}, err={e}")
+                continue
+
+            token_id = token_ids[i] if (token_ids and i < len(token_ids)) else None
+            label = outcome_label or market.get("question") or market.get("groupItemTitle", "")
+
+            parsed = parse_bucket_label(label)
+            if parsed is None:
+                # Fallback: try combining market title with outcome_label if label alone didn't parse
+                alt_label = f"{market.get('groupItemTitle','').strip()} {outcome_label}".strip()
+                parsed = parse_bucket_label(alt_label)
+                if parsed is None:
+                    print(f"  [pm] skipped outcome index {i}: label parse failed for label={label!r} alt_label={alt_label!r}")
+                    continue
+                else:
+                    label = alt_label
+
+            low, high = parsed
+            # clamp price to [0,1]
+            price = max(0.0, min(1.0, price))
+
+            buckets.append({
+                "label": label,
+                "price": price,
+                "token_id": token_id,
+                "low": low,
+                "high": high,
+                "raw_market": market,
+                "outcome_index": i,
+            })
     return buckets
 
 
