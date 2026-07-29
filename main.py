@@ -133,9 +133,19 @@ def run_check(bias_data: dict, target_date: str = None):
         result = se.evaluate_buckets(city, raw_values, city_bias, buckets)
         print(f"  {result.reason_code}: {result.detail}")
         if result.all_candidates:
-            print("  Full candidate table (est_prob | market | gap):")
-            for label, p, price, gap in result.all_candidates[:5]:
-                print(f"    {label}: {p:.1%} | {price:.1%} | {gap:+.1f}pp")
+            print("  Full candidate table (est_prob | market | gap | spread_cents | depth_ok):")
+            for row in result.all_candidates[:5]:
+                # support both old 4-tuple and new 6-tuple formats
+                label = row[0]
+                p = row[1] if len(row) > 1 else None
+                price = row[2] if len(row) > 2 else None
+                gap = row[3] if len(row) > 3 else None
+                spread = row[4] if len(row) > 4 else None
+                depth_ok = row[5] if len(row) > 5 else None
+                p_str = f"{p:.1%}" if isinstance(p, (int, float)) else "N/A"
+                price_str = f"{price:.1%}" if isinstance(price, (int, float)) else "N/A"
+                gap_str = f"{gap:+.1f}pp" if isinstance(gap, (int, float)) else "N/A"
+                print(f"    {label}: {p_str} | {price_str} | {gap_str} | spread={spread}c | depth_ok={depth_ok}")
 
         if result.signal:
             send_telegram(format_signal_alert(result.signal))
@@ -171,7 +181,8 @@ if __name__ == "__main__":
     check_number = 0
     while True:
         check_number += 1
-        print(f"\n[Check #{check_number} -- {dt.datetime.utcnow().isoformat()}]")
+        # use timezone-aware UTC to avoid deprecation warning
+        print(f"\n[Check #{check_number} -- {dt.datetime.now(dt.timezone.utc).isoformat()}]")
         try:
             bias_data = hindcast.load_bias_data(BIAS_DATA_PATH) or bias_data
             run_check(bias_data)
