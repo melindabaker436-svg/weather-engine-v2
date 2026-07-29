@@ -81,48 +81,85 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
     candidates = []
     for b in buckets:
         est_prob = prob_math.bucket_probability(b.low, b.high, mu, sigma)
+        # clamp and guard against NaN
+        if est_prob is None or not isinstance(est_prob, (int, float)):
+            est_prob = 0.0
+        est_prob = max(0.0, min(1.0, est_prob))
         gap_pp = round((est_prob - b.price) * 100, 1)
         candidates.append((b, est_prob, gap_pp))
 
+    # sort by gap desc (biggest edges first), but we'll iterate and pick the first viable one
     candidates.sort(key=lambda x: x[2], reverse=True)
-    candidate_table = [(b.label, round(p, 4), b.price, gap) for b, p, gap in candidates]
+
+    # include spread/depth in the candidate table for better diagnostics
+    candidate_table = [(b.label, round(p, 4), b.price, gap, b.spread_cents, b.depth_ok) for b, p, gap in candidates]
 
     if not candidates:
         return EvalResult(None, "no_buckets", "No buckets to evaluate.", candidate_table)
 
-    best_bucket, best_prob, best_gap = candidates[0]
+    # Event-level stale market detection: if the market looks dead (all tiny prices), skip the event
+    prices = [b.price for b, _, _ in candidates]
+    if max(prices) < 0.02 or sum(prices) < 0.05:
+        return EvalResult(None, "market_stale_snapshot",
+                          "Market prices appear to be a stale snapshot (all buckets tiny/untraded).",
+                          candidate_table)
 
-    if best_bucket.price < LONGSHOT_FLOOR:
-        return EvalResult(None, "longshot_floor",
-                           f"Best candidate '{best_bucket.label}' priced at {best_bucket.price:.2f}, "
-                           f"below the {LONGSHOT_FLOOR} longshot floor -- skipped regardless of edge. "
-                           f"NOTE: buckets priced near 0.00 are often untraded/stale snapshots, not real "
-                           f"live prices -- check all_candidates for what's happening on liquid buckets.",
-                           candidate_table)
+    # Iterate down candidates (by gap) and pick the first that passes all checks
+    rejection_reasons = []  # (label, reason, value)
+    chosen = None
+    for b, p, gap in candidates:
+        # sanity gap check
+        if gap > MAX_SANITY_GAP_PP:
+            # If gap is extremely large but price tiny, mark suspicious and continue to next candidate
+            rejection_reasons.append((b.label, "gap_implausible", gap))
+            continue
 
-    if best_gap > MAX_SANITY_GAP_PP:
-        return EvalResult(None, "gap_implausible",
-                           f"Gap {best_gap}pp on '{best_bucket.label}' exceeds sanity ceiling "
-                           f"{MAX_SANITY_GAP_PP}pp -- likely bad input, not real edge. "
-                           f"(mu={mu:.2f}, sigma={sigma:.2f}, est_prob={best_prob:.1%}, market={best_bucket.price:.1%})",
-                           candidate_table)
+        # longshot floor
+        if b.price < LONGSHOT_FLOOR:
+            rejection_reasons.append((b.label, "below_longshot_floor", b.price))
+            continue
 
-    if best_gap < MIN_GAP_PP:
-        return EvalResult(None, "gap_too_small",
-                           f"Best gap {best_gap}pp below minimum {MIN_GAP_PP}pp.", candidate_table)
+        # liquidity checks
+        if b.spread_cents is None or b.spread_cents > MAX_SPREAD_CENTS:
+            rejection_reasons.append((b.label, "spread_too_large", b.spread_cents))
+            continue
+        if b.depth_ok is False:
+            rejection_reasons.append((b.label, "insufficient_depth", b.depth_ok))
+            continue
 
-    if best_bucket.spread_cents is None or best_bucket.spread_cents > MAX_SPREAD_CENTS:
-        return EvalResult(None, "liquidity_fail",
-                           f"Spread {best_bucket.spread_cents}c on '{best_bucket.label}' exceeds "
-                           f"max {MAX_SPREAD_CENTS}c (or no real book).", candidate_table)
-    if best_bucket.depth_ok is False:
-        return EvalResult(None, "liquidity_fail", f"Insufficient depth on '{best_bucket.label}'.", candidate_table)
+        # minimum gap
+        if gap < MIN_GAP_PP:
+            rejection_reasons.append((b.label, "gap_too_small", gap))
+            continue
 
+        # candidate passes all checks
+        chosen = (b, p, gap)
+        break
+
+    # No viable candidate found -> build a reason
+    if not chosen:
+        # Determine dominant rejection reason for clearer messages
+        reasons = [r for _, r, _ in rejection_reasons]
+        if reasons and all(r == "below_longshot_floor" for r in reasons):
+            return EvalResult(None, "longshot_floor",
+                              "All candidates below longshot floor. See candidate_table for details.",
+                              candidate_table)
+        if any(r in ("spread_too_large", "insufficient_depth") for r in reasons):
+            return EvalResult(None, "liquidity_fail",
+                              "No candidate passed liquidity checks. See candidate_table for details.",
+                              candidate_table)
+        # fallback
+        return EvalResult(None, "no_viable_candidate",
+                          "No candidate passed selection filters. See candidate_table for details.",
+                          candidate_table)
+
+    # chosen candidate -> build signal
+    best_bucket, best_prob, best_gap = chosen
     sig = Signal(
         city=city, bucket_label=best_bucket.label, corrected_mu=round(mu, 2),
         sigma=round(sigma, 2), est_prob=round(best_prob, 4),
         market_price=best_bucket.price, gap_pp=best_gap, models_used=models_used,
     )
     return EvalResult(sig, "fired",
-                       f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
-                       f"{best_bucket.price:.1%}, gap {best_gap}pp.", candidate_table)
+                      f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
+                      f"{best_bucket.price:.1%}, gap {best_gap}pp.", candidate_table)
