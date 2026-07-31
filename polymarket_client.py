@@ -134,8 +134,18 @@ def get_order_book(token_id: str, timeout: int = 10) -> dict:
 
 
 def get_spread_and_depth(token_id: str, needed_usd: float = 30.0, max_slippage_pct: float = 3.0):
-    """Returns (spread_cents, depth_ok). (None, False) on empty/missing book --
-    no fake defaults, no scale tricks. What the book says is what we use."""
+    """
+    Returns (spread_cents, depth_ok). (None, False) on empty/missing book.
+
+    FIX (confirmed via Polymarket/polymarket-cli GitHub issue #75, not a guess):
+    the CLOB /book endpoint returns bids in ASCENDING price order (lowest first)
+    and asks in DESCENDING price order (highest first) -- the opposite of the
+    intuitive assumption. Best bid and best ask are both at the END of their
+    respective lists, not the start. Using bids[0]/asks[0] (the old code, in
+    every prior version of this project) computes (worst_ask - worst_bid), which
+    lands near 98-99c on almost any real book -- exactly the pattern seen in
+    production across every city for weeks. This was never a liquidity problem.
+    """
     if not token_id:
         return None, False
     try:
@@ -146,12 +156,15 @@ def get_spread_and_depth(token_id: str, needed_usd: float = 30.0, max_slippage_p
     if not bids or not asks:
         return None, False
 
-    best_bid, best_ask = float(bids[0]["price"]), float(asks[0]["price"])
+    best_bid = float(bids[-1]["price"])   # ascending order -> best (highest) bid is LAST
+    best_ask = float(asks[-1]["price"])   # descending order -> best (lowest) ask is LAST
     spread_cents = round((best_ask - best_bid) * 100, 2)
 
+    # Walk the ask side from the BEST price outward -- asks arrive worst-first,
+    # so we must reverse to accumulate depth starting from the best price.
     max_price = best_ask * (1 + max_slippage_pct / 100)
     filled = 0.0
-    for level in asks:
+    for level in reversed(asks):
         price = float(level["price"])
         if price > max_price:
             break
