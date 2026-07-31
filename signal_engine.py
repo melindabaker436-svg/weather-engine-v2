@@ -33,7 +33,8 @@ class Bucket:
     high: Optional[float]
     price: float
     token_id: Optional[str]
-    outcome: str = "Yes"  # 'Yes' or 'No' -- determines how probability is computed
+    outcome: str = "Yes"
+    market_id: Optional[str] = None
     spread_cents: Optional[float] = None
     depth_ok: Optional[bool] = None
 
@@ -49,6 +50,9 @@ class Signal:
     gap_pp: float
     models_used: list
     used_live_obs: bool = False
+    token_id: Optional[str] = None
+    market_id: Optional[str] = None
+    outcome: str = "Yes"
 
 
 @dataclass
@@ -154,7 +158,8 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
         city=city, bucket_label=best_bucket.label, corrected_mu=round(mu, 2),
         sigma=round(sigma, 2), est_prob=round(best_prob, 4),
         market_price=best_bucket.price, gap_pp=best_gap, models_used=models_used,
-        used_live_obs=used_live_obs,
+        used_live_obs=used_live_obs, token_id=best_bucket.token_id,
+        market_id=best_bucket.market_id, outcome=best_bucket.outcome,
     )
     return EvalResult(sig, "fired",
                        f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "

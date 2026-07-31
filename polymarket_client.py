@@ -142,9 +142,19 @@ def get_market_buckets(event: dict) -> list:
                 "label": f"{question_label} [{outcome_name}]",
                 "price": price, "token_id": token_id,
                 "low": low, "high": high,
-                "outcome": outcome_name,  # 'Yes' or 'No' -- signal_engine uses this
+                "outcome": outcome_name,
+                "market_id": market.get("id"),  # for resolution lookup later
             })
     return buckets
+
+
+def get_market_by_id(market_id: str, timeout: int = 15) -> dict:
+    """Direct lookup, used by journal.py to check whether a specific market
+    has resolved yet. GET /markets/{id} is Gamma's confirmed single-market
+    endpoint (docs.polymarket.com/developers/gamma-markets-api)."""
+    resp = requests.get(f"{GAMMA_BASE}/markets/{market_id}", timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
 
 
 def get_order_book(token_id: str, timeout: int = 10) -> dict:
