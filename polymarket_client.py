@@ -24,7 +24,8 @@ CLOB_BASE = "https://clob.polymarket.com"
 
 _OR_BELOW_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*[CF]?\s*or below", re.IGNORECASE)
 _OR_HIGHER_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*[CF]?\s*or higher", re.IGNORECASE)
-_SINGLE_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°\s*([CF])(?!\w)", re.IGNORECASE)
+_RANGE_RE = re.compile(r"between\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*°\s*([CF])", re.IGNORECASE)
+_SINGLE_RE = re.compile(r"(?<![\d-])(-?\d+(?:\.\d+)?)\s*°\s*([CF])(?!\w)", re.IGNORECASE)
 
 
 def find_events_by_keywords(keywords: list, timeout: int = 15) -> list:
@@ -68,19 +69,38 @@ def find_matching_event(keywords: list, target_date: str) -> dict:
 
 
 def parse_bucket_label(label: str):
-    """Returns (low, high). None/None edges for open-ended tails."""
+    """
+    Returns (low, high). None/None edges for open-ended tails.
+
+    FIX: "between 84-85°F" style range buckets were being misparsed by the
+    single-value regex, which matched "-85" as a NEGATIVE 85 (reading the range
+    dash as a minus sign) instead of recognizing "84-85" as a range. This
+    produced impossible bucket bounds (~-85°F on a July day), which silently
+    broke every probability calculation for NYC/Chicago (Yes computed near 0%
+    against the bogus negative range -> No came out near 100% on EVERYTHING).
+    Range format is now checked FIRST and explicitly, before any single-value
+    fallback can misfire on it.
+    """
+    m = _RANGE_RE.search(label)
+    if m:
+        low_val, high_val = float(m.group(1)), float(m.group(2))
+        return low_val - 0.5, high_val + 0.5  # e.g. "84-85" -> [83.5, 85.5)
+
     m = _OR_BELOW_RE.search(label)
     if m:
         val = float(m.group(1))
         return None, val + 0.5
+
     m = _OR_HIGHER_RE.search(label)
     if m:
         val = float(m.group(1))
         return val - 0.5, None
+
     m = _SINGLE_RE.search(label)
     if m:
         val = float(m.group(1))
         return val - 0.5, val + 0.5
+
     return None
 
 
