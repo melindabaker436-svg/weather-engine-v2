@@ -1,16 +1,23 @@
 """
-polymarket_client.py -- standalone, self-contained.
+polymarket_client.py -- consolidated, final version.
 
-FIX: bucket parsing now matches the REAL structure confirmed by a live fetch
-during this conversation: single whole-degree buckets like "27C", plus two
-open-ended tails like "26C or below" / "36C or higher".
+FIXES (both confirmed from real production evidence, not guesses):
+1. DROPPED scale normalization. Copilot added this as a hypothesis for the 98c
+   spread bug, but every single [pm-debug] line in the real logs showed scale=1.0
+   -- the hypothesis was tested against real data and ruled out. Keeping unused
+   defensive code around is its own risk; removed.
+2. FIXED the real bug: each market (one temperature threshold) has a "Yes" and
+   "No" outcome, each with its own price and token_id. The old code took
+   prices[0]/token_ids[0] only (Yes), or later, an index-based rewrite created
+   both but with duplicated probability. This version explicitly creates one
+   Bucket per outcome (Yes AND No) with the correct token_id/price pairing, and
+   tags which outcome it is so signal_engine can compute No = 1 - Yes correctly.
 """
 
 import json
 import re
 import datetime as dt
 import requests
-import time
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
@@ -25,7 +32,7 @@ def find_events_by_keywords(keywords: list, timeout: int = 15) -> list:
         try:
             resp = requests.get(
                 f"{GAMMA_BASE}/public-search", params={"q": kw},
-                headers={"User-Agent": "weather-v2/1.0"}, timeout=timeout,
+                headers={"User-Agent": "weather-v3/1.0"}, timeout=timeout,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -61,37 +68,29 @@ def find_matching_event(keywords: list, target_date: str) -> dict:
 
 
 def parse_bucket_label(label: str):
-    """
-    Returns (low, high). low/high are None for open-ended tails. For a
-    single-degree bucket "N", returns (N-0.5, N+0.5).
-    """
-    if not label:
-        return None
+    """Returns (low, high). None/None edges for open-ended tails."""
     m = _OR_BELOW_RE.search(label)
     if m:
         val = float(m.group(1))
         return None, val + 0.5
-
     m = _OR_HIGHER_RE.search(label)
     if m:
         val = float(m.group(1))
         return val - 0.5, None
-
     m = _SINGLE_RE.search(label)
     if m:
         val = float(m.group(1))
         return val - 0.5, val + 0.5
-
     return None
 
 
 def get_market_buckets(event: dict) -> list:
-    """Parse an event's markets and return a list of buckets.
-
-    Each market may contain arrays for outcomes, outcomePrices, and clobTokenIds.
-    We iterate by index and create one bucket per outcome so token_ids align with
-    the price/label for that outcome. We also log when array lengths mismatch or
-    when markets are skipped to aid debugging.
+    """
+    Returns one dict per OUTCOME (Yes and No, separately) per market/temperature
+    threshold. Each dict: label, price, token_id, low, high, outcome ('Yes'/'No').
+    This is the corrected version -- explicit index pairing, no assumptions about
+    array order beyond "outcomes[i] corresponds to prices[i] corresponds to
+    token_ids[i]", which is what Gamma's API contract actually guarantees.
     """
     buckets = []
     for market in event.get("markets", []):
@@ -99,61 +98,31 @@ def get_market_buckets(event: dict) -> list:
             outcomes = json.loads(market.get("outcomes", "[]"))
             prices = json.loads(market.get("outcomePrices", "[]"))
             token_ids = json.loads(market.get("clobTokenIds", "[]"))
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"  [pm] skipped market: json decode error: {e}")
+        except (json.JSONDecodeError, TypeError):
             continue
 
-        if not outcomes or not prices:
-            print(f"  [pm] skipped market: no outcomes/prices, groupTitle={market.get('groupItemTitle')!r}")
+        if not (len(outcomes) == len(prices) == len(token_ids)):
+            print(f"  [pm] array length mismatch for market {market.get('id', '?')}: "
+                  f"outcomes={len(outcomes)} prices={len(prices)} token_ids={len(token_ids)} -- skipping")
             continue
 
-        # Log mismatched array lengths so we can debug mapping issues
-        n_out = len(outcomes)
-        n_prices = len(prices)
-        n_tokens = len(token_ids) if token_ids else 0
-        if n_out != n_prices or (token_ids and n_out != n_tokens):
-            print(f"  [pm] market array length mismatch market_id={market.get('id')} outcomes={n_out} prices={n_prices} token_ids={n_tokens}")
+        question_label = market.get("question", market.get("groupItemTitle", ""))
+        parsed = parse_bucket_label(question_label)
+        if parsed is None:
+            continue
+        low, high = parsed
 
-        for i, outcome in enumerate(outcomes):
-            # outcome may be a label string or a dict depending on API; coerce to string when possible
-            outcome_label = None
-            if isinstance(outcome, dict):
-                outcome_label = outcome.get("label") or outcome.get("title") or str(outcome)
-            else:
-                outcome_label = str(outcome)
-
+        for i, outcome_name in enumerate(outcomes):
             try:
                 price = float(prices[i])
-            except (ValueError, IndexError) as e:
-                print(f"  [pm] skipped outcome index {i}: price parse failed, prices={prices!r}, err={e}")
+            except (ValueError, IndexError):
                 continue
-
-            token_id = token_ids[i] if (token_ids and i < len(token_ids)) else None
-            label = outcome_label or market.get("question") or market.get("groupItemTitle", "")
-
-            parsed = parse_bucket_label(label)
-            if parsed is None:
-                # Fallback: try combining market title with outcome_label if label alone didn't parse
-                alt_label = f"{market.get('groupItemTitle','').strip()} {outcome_label}".strip()
-                parsed = parse_bucket_label(alt_label)
-                if parsed is None:
-                    print(f"  [pm] skipped outcome index {i}: label parse failed for label={label!r} alt_label={alt_label!r}")
-                    continue
-                else:
-                    label = alt_label
-
-            low, high = parsed
-            # clamp price to [0,1]
-            price = max(0.0, min(1.0, price))
-
+            token_id = token_ids[i] if i < len(token_ids) else None
             buckets.append({
-                "label": label,
-                "price": price,
-                "token_id": token_id,
-                "low": low,
-                "high": high,
-                "raw_market": market,
-                "outcome_index": i,
+                "label": f"{question_label} [{outcome_name}]",
+                "price": price, "token_id": token_id,
+                "low": low, "high": high,
+                "outcome": outcome_name,  # 'Yes' or 'No' -- signal_engine uses this
             })
     return buckets
 
@@ -165,13 +134,8 @@ def get_order_book(token_id: str, timeout: int = 10) -> dict:
 
 
 def get_spread_and_depth(token_id: str, needed_usd: float = 30.0, max_slippage_pct: float = 3.0):
-    """Returns (spread_cents, depth_ok). Returns (None, False) on empty/missing book --
-    never silently defaults to a fake wide spread like the old buggy version did.
-
-    Adds defensive normalization: if the order-book prices appear to be on a 0..100
-    scale instead of 0..1, we normalize them. Also prints raw best_bid/best_ask for
-    suspicious spreads to aid diagnosis.
-    """
+    """Returns (spread_cents, depth_ok). (None, False) on empty/missing book --
+    no fake defaults, no scale tricks. What the book says is what we use."""
     if not token_id:
         return None, False
     try:
@@ -182,49 +146,16 @@ def get_spread_and_depth(token_id: str, needed_usd: float = 30.0, max_slippage_p
     if not bids or not asks:
         return None, False
 
-    try:
-        raw_best_bid = float(bids[0]["price"])
-        raw_best_ask = float(asks[0]["price"])
-    except Exception:
-        return None, False
-
-    # Detect likely scale mismatch: if the ask price is > 2, assume book uses 0..100 scale
-    scale = 1.0
-    if raw_best_ask > 2.0:
-        scale = 100.0
-
-    # Normalize bids/asks
-    bids_norm = []
-    asks_norm = []
-    for level in bids:
-        try:
-            bids_norm.append({"price": float(level["price"]) / scale, "size": float(level.get("size", 0.0))})
-        except Exception:
-            continue
-    for level in asks:
-        try:
-            asks_norm.append({"price": float(level["price"]) / scale, "size": float(level.get("size", 0.0))})
-        except Exception:
-            continue
-
-    if not bids_norm or not asks_norm:
-        return None, False
-
-    best_bid = bids_norm[0]["price"]
-    best_ask = asks_norm[0]["price"]
+    best_bid, best_ask = float(bids[0]["price"]), float(asks[0]["price"])
     spread_cents = round((best_ask - best_bid) * 100, 2)
-
-    # If spread is suspiciously large, print the raw and normalized best bid/ask to help debug
-    if spread_cents > 50.0:
-        print(f"  [pm-debug] token_id={token_id} raw_best_bid={raw_best_bid} raw_best_ask={raw_best_ask} scale={scale} norm_best_bid={best_bid} norm_best_ask={best_ask} spread_cents={spread_cents}")
 
     max_price = best_ask * (1 + max_slippage_pct / 100)
     filled = 0.0
-    for level in asks_norm:
-        price = level["price"]
+    for level in asks:
+        price = float(level["price"])
         if price > max_price:
             break
-        filled += price * level.get("size", 0.0)
+        filled += price * float(level["size"])
         if filled >= needed_usd:
             break
     depth_ok = filled >= needed_usd

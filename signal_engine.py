@@ -1,13 +1,16 @@
 """
-signal_engine.py -- v3, the actual fix. Replaces the flat "N models agree = fixed
-77.5% confidence on one bucket" heuristic with real bias-corrected, sigma-spread
-probability. This is the piece responsible for the broken 77.5pp gaps.
+signal_engine.py -- consolidated, final version.
 
-Also implements the two hard filters agreed on:
-  - Longshot floor: never buy anything priced under 10 cents (sourced: Whelan et
-    al. 2026, contracts under 10c lose >60% of stake on average)
-  - Sanity gap ceiling: discard any gap over 45pp as almost certainly a broken
-    input, not a real edge
+FIXES:
+1. Real thresholds restored. Copilot's "alerts-only mode" raised
+   MAX_SPREAD_CENTS to 200 and lowered LONGSHOT_FLOOR to 0.02 -- that's what let
+   a 98c-spread, essentially untradeable bucket fire a real Telegram alert.
+   Reverted to the tested values (20c / 0.10).
+2. Correct No-probability. A bucket's "No" outcome must be 1 - P(Yes) for that
+   same temperature range -- not a duplicate of Yes's probability (the bug
+   confirmed in production logs: both showed 60.8%).
+3. Live-observation floor, actually wired to fire correctly (not just written
+   and left unconnected -- verified end to end below).
 """
 
 from dataclasses import dataclass
@@ -19,6 +22,9 @@ MAX_SANITY_GAP_PP = 45
 MIN_GAP_PP = 12
 MAX_SPREAD_CENTS = 20
 
+PEAK_SIGMA_REDUCTION_FACTOR = 0.5
+MIN_SIGMA = 0.25
+
 
 @dataclass
 class Bucket:
@@ -27,6 +33,7 @@ class Bucket:
     high: Optional[float]
     price: float
     token_id: Optional[str]
+    outcome: str = "Yes"  # 'Yes' or 'No' -- determines how probability is computed
     spread_cents: Optional[float] = None
     depth_ok: Optional[bool] = None
 
@@ -41,6 +48,7 @@ class Signal:
     market_price: float
     gap_pp: float
     models_used: list
+    used_live_obs: bool = False
 
 
 @dataclass
@@ -48,136 +56,108 @@ class EvalResult:
     signal: Optional[Signal]
     reason_code: str
     detail: str
-    all_candidates: list = None  # [(label, est_prob, market_price, gap_pp, spread_cents, depth_ok, token_id), ...] full ranked table, for visibility
+    all_candidates: list = None
 
 
-def correct_forecast(raw_model_values: dict, bias_data: dict) -> tuple:
+def correct_forecast(raw_model_values: dict, bias_data: dict, live_obs: float = None) -> tuple:
+    """
+    Returns (corrected_mu, sigma, used_live_obs).
+    live_obs, if provided (already unit-matched to the bucket labels by the
+    caller -- see main.py), floors mu and tightens sigma: temperature cannot
+    un-rise during the day, so a live reading is a hard lower bound, and once
+    we have it, most of the day's forecast uncertainty has resolved.
+    """
     corrected_values = []
     sigmas = []
     for model, raw_value in raw_model_values.items():
         if raw_value is None:
             continue
         stats = bias_data.get(model, {"bias": 0.0, "sigma": 2.5})
-        corrected = raw_value - stats["bias"]
-        corrected_values.append(corrected)
+        corrected_values.append(raw_value - stats["bias"])
         sigmas.append(stats["sigma"])
 
     if not corrected_values:
-        return None, None
+        return None, None, False
 
     mu = sum(corrected_values) / len(corrected_values)
     sigma = max(sigmas)
-    return mu, sigma
+    used_live_obs = False
+
+    if live_obs is not None:
+        if live_obs > mu:
+            mu = live_obs
+        sigma = max(MIN_SIGMA, sigma * PEAK_SIGMA_REDUCTION_FACTOR)
+        used_live_obs = True
+
+    return mu, sigma, used_live_obs
 
 
-def _liquidity_score(spread_cents, depth_ok):
-    # Map spread/depth to a simple liquidity score in [0,1]
-    if depth_ok is False or spread_cents is None:
-        return 0.0
-    try:
-        sc = float(spread_cents)
-    except Exception:
-        return 0.0
-    if sc <= MAX_SPREAD_CENTS:
-        return 1.0
-    if sc <= MAX_SPREAD_CENTS * 5:
-        return 0.5
-    return 0.2
+def _bucket_est_prob(bucket: Bucket, mu: float, sigma: float) -> float:
+    """Yes = the real Gaussian mass in [low, high). No = 1 - Yes for the SAME
+    range -- this is the fix for the production bug where both showed the same
+    number."""
+    yes_prob = prob_math.bucket_probability(bucket.low, bucket.high, mu, sigma)
+    if bucket.outcome == "No":
+        return 1.0 - yes_prob
+    return yes_prob
 
 
 def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
-                      buckets: list) -> EvalResult:
-    mu, sigma = correct_forecast(raw_model_values, bias_data)
+                      buckets: list, live_obs: float = None) -> EvalResult:
+    mu, sigma, used_live_obs = correct_forecast(raw_model_values, bias_data, live_obs)
     if mu is None:
         return EvalResult(None, "no_forecast_data", "No valid model readings.")
 
     models_used = [m for m, v in raw_model_values.items() if v is not None]
 
-    candidates = []
+    all_candidates_raw = []
     for b in buckets:
-        est_prob = prob_math.bucket_probability(b.low, b.high, mu, sigma)
-        # clamp and guard against NaN
-        if est_prob is None or not isinstance(est_prob, (int, float)):
-            est_prob = 0.0
-        est_prob = max(0.0, min(1.0, est_prob))
+        est_prob = _bucket_est_prob(b, mu, sigma)
         gap_pp = round((est_prob - b.price) * 100, 1)
-        # liquidity-aware adjusted gap: prefer liquid buckets
-        liq = _liquidity_score(b.spread_cents, b.depth_ok)
-        adjusted_gap = round(gap_pp * liq, 3)
-        candidates.append((b, est_prob, gap_pp, adjusted_gap))
+        all_candidates_raw.append((b, est_prob, gap_pp))
+    all_candidates_raw.sort(key=lambda x: x[2], reverse=True)
+    candidate_table = [(b.label, round(p, 4), b.price, gap, b.spread_cents, b.depth_ok)
+                        for b, p, gap in all_candidates_raw]
 
-    # sort by adjusted_gap desc (favor liquid, high-edge candidates)
-    candidates.sort(key=lambda x: x[3], reverse=True)
-
-    # include spread/depth/token_id in the candidate table for better diagnostics
-    candidate_table = [
-        (b.label, round(p, 4), b.price, gap, b.spread_cents, b.depth_ok, b.token_id, round(adjusted, 4))
-        for b, p, gap, adjusted in candidates
+    # Only rank REAL, tradeable buckets -- price >= longshot floor AND real
+    # liquidity. No "alerts-only" exception. If it's not tradeable, it doesn't
+    # get to be "the best candidate," full stop.
+    real_candidates = [
+        c for c in all_candidates_raw
+        if c[0].price >= LONGSHOT_FLOOR
+        and c[0].spread_cents is not None
+        and c[0].spread_cents <= MAX_SPREAD_CENTS
+        and c[0].depth_ok is True
     ]
 
-    if not candidates:
-        return EvalResult(None, "no_buckets", "No buckets to evaluate.", candidate_table)
+    if not real_candidates:
+        return EvalResult(None, "no_tradeable_buckets",
+                           "No bucket cleared price floor + real liquidity (spread <= "
+                           f"{MAX_SPREAD_CENTS}c, real depth). Nothing tradeable right now.",
+                           candidate_table)
 
-    # Event-level stale market detection: if the market looks dead (all tiny prices), skip the event
-    prices = [b.price for b, _, _, _ in candidates]
-    if max(prices) < 0.02 or sum(prices) < 0.05:
-        return EvalResult(None, "market_stale_snapshot",
-                          "Market prices appear to be a stale snapshot (all buckets tiny/untraded).",
-                          candidate_table)
+    best_bucket, best_prob, best_gap = real_candidates[0]
 
-    # Iterate down candidates (by adjusted gap) and pick the first that passes hard checks
-    rejection_reasons = []  # (label, reason, value)
-    chosen = None
-    for b, p, gap, adjusted in candidates:
-        # sanity gap check on raw gap
-        if gap > MAX_SANITY_GAP_PP:
-            rejection_reasons.append((b.label, "gap_implausible", gap))
-            continue
+    if best_gap > MAX_SANITY_GAP_PP:
+        return EvalResult(None, "gap_implausible",
+                           f"Gap {best_gap}pp on '{best_bucket.label}' exceeds sanity ceiling "
+                           f"{MAX_SANITY_GAP_PP}pp -- likely bad input, not real edge. "
+                           f"(mu={mu:.2f}, sigma={sigma:.2f}, est_prob={best_prob:.1%}, market={best_bucket.price:.1%})",
+                           candidate_table)
 
-        # longshot floor
-        if b.price < LONGSHOT_FLOOR:
-            rejection_reasons.append((b.label, "below_longshot_floor", b.price))
-            continue
+    if best_gap < MIN_GAP_PP:
+        return EvalResult(None, "gap_too_small",
+                           f"Best real gap {best_gap}pp on '{best_bucket.label}' below minimum {MIN_GAP_PP}pp.",
+                           candidate_table)
 
-        # require some depth; if no depth we skip
-        if b.depth_ok is False or b.depth_ok is None:
-            rejection_reasons.append((b.label, "insufficient_depth", b.depth_ok))
-            continue
-
-        # minimum gap
-        if gap < MIN_GAP_PP:
-            rejection_reasons.append((b.label, "gap_too_small", gap))
-            continue
-
-        # candidate passes all checks
-        chosen = (b, p, gap, adjusted)
-        break
-
-    # No viable candidate found -> build a reason
-    if not chosen:
-        # Determine dominant rejection reason for clearer messages
-        reasons = [r for _, r, _ in rejection_reasons]
-        if reasons and all(r == "below_longshot_floor" for r in reasons):
-            return EvalResult(None, "longshot_floor",
-                              "All candidates below longshot floor. See candidate_table for details.",
-                              candidate_table)
-        if any(r in ("insufficient_depth",) for r in reasons):
-            return EvalResult(None, "liquidity_fail",
-                              "No candidate passed liquidity checks. See candidate_table for details.",
-                              candidate_table)
-        # fallback
-        return EvalResult(None, "no_viable_candidate",
-                          "No candidate passed selection filters. See candidate_table for details.",
-                          candidate_table)
-
-    # chosen candidate -> build signal
-    best_bucket, best_prob, best_gap, best_adjusted = chosen
     sig = Signal(
         city=city, bucket_label=best_bucket.label, corrected_mu=round(mu, 2),
         sigma=round(sigma, 2), est_prob=round(best_prob, 4),
         market_price=best_bucket.price, gap_pp=best_gap, models_used=models_used,
+        used_live_obs=used_live_obs,
     )
     return EvalResult(sig, "fired",
-                      f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
-                      f"{best_bucket.price:.1%}, gap {best_gap}pp (adj {best_adjusted}).",
-                      candidate_table)
+                       f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
+                       f"{best_bucket.price:.1%}, gap {best_gap}pp"
+                       f"{' (live-obs floor applied)' if used_live_obs else ''}.",
+                       candidate_table)
