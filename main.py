@@ -14,6 +14,7 @@ import sys
 import time
 import datetime as dt
 import requests
+import quopri
 
 import hindcast
 import polymarket_client as pm
@@ -45,15 +46,44 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
+def _prepare_for_telegram(raw_text: str) -> str:
+    """Defensively normalize and escape text before sending to Telegram.
+
+    - If the text looks like quoted-printable (contains '=20' or soft line breaks),
+      try to decode it.
+    - Replace the comparison operator '<=' with the unicode '≤' to avoid creating
+      a '<' that Telegram will interpret as an HTML tag start.
+    - Escape the minimal HTML special characters so parse_mode='HTML' is safe.
+    """
+    text = raw_text
+    try:
+        if '=20' in text or '=\r\n' in text:
+            # Attempt to decode quoted-printable artifacts
+            decoded = quopri.decodestring(text.encode('utf-8', errors='replace'))
+            text = decoded.decode('utf-8', errors='replace')
+    except Exception:
+        # Best-effort; if decoding fails, keep original
+        text = raw_text
+
+    # Avoid raw '<' sequences that look like tags; convert '<=' to '≤' first.
+    text = text.replace('<=', '≤')
+
+    # Escape HTML special chars so parse_mode='HTML' is safe
+    text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    return text
+
+
 def send_telegram(text: str, timeout: int = 10) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[telegram] Not configured -- printing instead:")
         print(text)
         return False
     try:
+        safe_text = _prepare_for_telegram(text)
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text, "parse_mode": "HTML"},
             timeout=timeout,
         )
         if not resp.ok:
@@ -152,7 +182,7 @@ def format_signal_alert(signal: se.Signal) -> str:
         f"Est. probability: {signal.est_prob:.1%}\n"
         f"Market price: {signal.market_price:.1%}\n"
         f"Gap: +{signal.gap_pp}pp\n"
-        f"-- real liquidity checked (spread<=20c, real depth), longshot floor, sanity ceiling all passed."
+        f"-- real liquidity checked (spread ≤20c, real depth), longshot floor, sanity ceiling all passed."
     )
 
 
