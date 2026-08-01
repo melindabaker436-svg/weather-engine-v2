@@ -1,4 +1,4 @@
-"""
+""" 
 hindcast.py -- computes real per-city forecast bias and sigma from historical data.
 Run ONCE (or periodically, e.g. weekly) via:
     python main.py hindcast
