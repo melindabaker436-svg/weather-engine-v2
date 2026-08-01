@@ -16,6 +16,7 @@ import re
 import hindcast
 import polymarket_client as pm
 import signal_engine as se
+import journal
 
 CITIES = {
     "London": {"lat": 51.5074, "lon": -0.1278, "unit": "C",
@@ -221,6 +222,12 @@ def format_signal_alert(signal: se.Signal) -> str:
 def run_check(bias_data: dict, target_date: str = None):
     target_date = target_date or (dt.date.today() + dt.timedelta(days=1)).isoformat()
 
+    # Resolve any previously-open signals before starting this cycle
+    try:
+        journal.check_and_resolve_open_signals()
+    except Exception as e:
+        print(f"[journal] Background resolution check failed: {e}")
+
     for city, cfg in CITIES.items():
         print(f"--- {city} ---")
 
@@ -255,7 +262,7 @@ def run_check(bias_data: dict, target_date: str = None):
             buckets.append(se.Bucket(
                 label=rb["label"], low=rb["low"], high=rb["high"], price=rb["price"],
                 token_id=rb["token_id"], outcome=rb["outcome"],
-                spread_cents=spread_cents, depth_ok=depth_ok,
+                market_id=rb.get("market_id"), spread_cents=spread_cents, depth_ok=depth_ok,
             ))
 
         if not buckets:
@@ -270,8 +277,21 @@ def run_check(bias_data: dict, target_date: str = None):
                 print(f"    {label}: {p:.1%} | {price:.1%} | {gap:+.1f}pp | {spread}c | {depth}")
 
         if result.signal:
-            send_telegram(format_signal_alert(result.signal))
-            print("  -> Telegram alert sent.")
+            # Log the signal to the journal (paper-trade) and send alert.
+            try:
+                signal_id = journal.log_signal(result.signal)
+            except Exception as e:
+                signal_id = None
+                print(f"  [journal] Failed to log signal: {e}")
+
+            alert_text = format_signal_alert(result.signal)
+            if signal_id:
+                alert_text += f"\nSignal ID: {signal_id}"
+
+            send_ok = send_telegram(alert_text)
+            print(f"  -> Telegram alert sent: {send_ok}")
+            if signal_id:
+                print(f"  -> Logged signal id {signal_id} in {journal.JOURNAL_PATH}")
 
 
 def run_self_test(bias_data):
@@ -282,6 +302,15 @@ def run_self_test(bias_data):
         print("[!] No bias_data.json found -- run 'python main.py hindcast' first.")
     else:
         print(f"[OK] bias_data.json loaded for {len(bias_data)} cities.")
+
+    # Run a quick journal summary and ensure path exists
+    try:
+        journal._ensure_file()
+        print(f"[OK] Journal path: {journal.JOURNAL_PATH}")
+        journal.print_summary()
+    except Exception as e:
+        print(f"[journal] Self-test failed or journal not writable: {e}")
+
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         ok = send_telegram("\u2705 Weather engine v3 started. Real thresholds restored, "
                             "No-probability bug fixed, live-obs floor wired.")
