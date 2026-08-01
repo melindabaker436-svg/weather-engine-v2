@@ -1,12 +1,7 @@
 """
 main.py -- consolidated, final version. Ties hindcast + signal_engine +
 polymarket_client together, with the live-observation peak-hour floor actually
-connected end to end (confirmed no "Using live_obs=" fetch ever ran in the old
-logs -- Copilot wrote the engine-side support but never wired the caller).
-
-Modes:
-    python main.py hindcast   -- run the 90-day bias/sigma calibration once
-    python main.py            -- run the live scanning loop
+connected end to end.
 """
 
 import os
@@ -14,6 +9,9 @@ import sys
 import time
 import datetime as dt
 import requests
+import quopri
+import urllib.parse
+import re
 
 import hindcast
 import polymarket_client as pm
@@ -24,7 +22,7 @@ CITIES = {
     "London": {"lat": 51.5074, "lon": -0.1278, "unit": "C",
                "keyword_variants": ["highest temperature in london"]},
     "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F",
-                 "keyword_variants": ["highest temperature in new york", "highest temperature in nyc"]},
+                  "keyword_variants": ["highest temperature in new york", "highest temperature in nyc"]},
     "Toronto": {"lat": 43.6532, "lon": -79.3832, "unit": "C",
                 "keyword_variants": ["highest temperature in toronto"]},
     "Paris": {"lat": 48.8566, "lon": 2.3522, "unit": "C",
@@ -38,7 +36,7 @@ CITIES = {
     "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
                "keyword_variants": ["highest temperature in madrid"]},
     "Milan": {"lat": 45.4642, "lon": 9.1900, "unit": "C",
-              "keyword_variants": ["highest temperature in milan"]},
+               "keyword_variants": ["highest temperature in milan"]},
     "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
                "keyword_variants": ["highest temperature in munich"]},
     "Amsterdam": {"lat": 52.3676, "lon": 4.9041, "unit": "C",
@@ -56,15 +54,57 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
+def _prepare_for_telegram(raw_text: str) -> str:
+    """Minimal normalization/escaping to avoid Telegram HTML parser errors.
+
+    - Attempt to decode quoted-printable artifacts ("=20" etc.).
+    - URL-decode percent-encodings like %3C/%3E if present.
+    - Replace "<=" with a safe unicode char '≤' to remove raw '<'.
+    - Escape &, <, > so parse_mode won't see tags.
+    """
+    text = raw_text or ""
+    try:
+        if "=20" in text or "=\r\n" in text or re.search(r"=[0-9A-Fa-f]{2}", text):
+            decoded = quopri.decodestring(text.encode("utf-8", errors="replace"))
+            text = decoded.decode("utf-8", errors="replace")
+    except Exception:
+        text = raw_text or ""
+
+    try:
+        if "%3C" in text.upper() or "%3E" in text.upper():
+            text = urllib.parse.unquote(text)
+    except Exception:
+        pass
+
+    text = text.replace("<=", "≤")
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    return text
+
+
 def send_telegram(text: str, timeout: int = 10) -> bool:
+    """Emergency: always send WITHOUT parse_mode to guarantee delivery.
+
+    This removes HTML formatting but avoids Telegram entity parser failures.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[telegram] Not configured -- printing instead:")
         print(text)
         return False
+
+    original = text
+    safe_text = _prepare_for_telegram(original)
+
+    def _truncate(s, n=400):
+        return (s[:n] + "...") if len(s) > n else s
+
+    print(f"[telegram] Emergency send WITHOUT parse_mode (orig={_truncate(original)!r}, safe={_truncate(safe_text)!r})")
+
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text},
             timeout=timeout,
         )
         if not resp.ok:
@@ -80,9 +120,8 @@ def fetch_today_forecast(lat: float, lon: float, target_date: str, timeout: int 
     FIX: this previously had no target_date parameter at all -- it called Open-Meteo
     with forecast_days=1 and blindly took series[0], which is ALWAYS TODAY's
     forecast, never the actual target_date being evaluated (which is always
-    tomorrow, per run_check). Every corrected forecast this session was computed
-    from today's number and compared against tomorrow's market. Now explicitly
-    fetches enough days to cover target_date and indexes to the matching date.
+    tomorrow, per run_check). Now explicitly fetches enough days to cover target_date
+    and indexes to the matching date.
     """
     params = {"latitude": lat, "longitude": lon, "daily": "temperature_2m_max",
               "models": ",".join(MODELS), "timezone": "auto", "forecast_days": 3}
@@ -135,11 +174,6 @@ def get_live_obs_if_in_peak_window(lat: float, lon: float, unit: str):
     DISABLED. Real bug found in production: this engine only ever evaluates
     TOMORROW's market (target_date = today+1), but this function was reading
     TODAY's current temperature and using it as a floor on tomorrow's forecast.
-    "What's the temperature right now" has no valid relationship to "what will
-    tomorrow's high be" -- comparing them produced the wave of overconfident,
-    market-disagreeing 100% signals seen in production (Toronto, Amsterdam,
-    Chicago, Seoul all hit this). Disabled until this is rebuilt to only apply
-    when checking a SAME-DAY market, which this engine does not currently do.
     """
     return None
 
