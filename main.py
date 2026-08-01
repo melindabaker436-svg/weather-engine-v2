@@ -1,7 +1,12 @@
 """
 main.py -- consolidated, final version. Ties hindcast + signal_engine +
 polymarket_client together, with the live-observation peak-hour floor actually
-connected end to end.
+connected end to end (confirmed no "Using live_obs=" fetch ever ran in the old
+logs -- Copilot wrote the engine-side support but never wired the caller).
+
+Modes:
+    python main.py hindcast   -- run the 90-day bias/sigma calibration once
+    python main.py            -- run the live scanning loop
 """
 
 import os
@@ -9,9 +14,6 @@ import sys
 import time
 import datetime as dt
 import requests
-import quopri
-import urllib.parse
-import re
 
 import hindcast
 import polymarket_client as pm
@@ -36,7 +38,7 @@ CITIES = {
     "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
                "keyword_variants": ["highest temperature in madrid"]},
     "Milan": {"lat": 45.4642, "lon": 9.1900, "unit": "C",
-               "keyword_variants": ["highest temperature in milan"]},
+              "keyword_variants": ["highest temperature in milan"]},
     "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
                "keyword_variants": ["highest temperature in munich"]},
     "Amsterdam": {"lat": 52.3676, "lon": 4.9041, "unit": "C",
@@ -54,146 +56,50 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def _prepare_for_telegram(raw_text: str) -> str:
-    """Normalize and escape text before sending to Telegram.
-
-    Steps (best-effort):
-    - Attempt to decode quoted-printable artifacts.
-    - URL-decode percent-encoding (e.g., %3C) if present.
-    - Replace "<=" with unicode '≤' to avoid raw '<' starting a tag.
-    - Escape &, <, > for HTML parse mode.
-    """
-    text = raw_text or ""
-
-    # Try to decode quoted-printable artifacts
-    try:
-        if "=20" in text or "=\r\n" in text or re.search(r"=[0-9A-Fa-f]{2}", text):
-            decoded = quopri.decodestring(text.encode("utf-8", errors="replace"))
-            text = decoded.decode("utf-8", errors="replace")
-    except Exception:
-        # keep original if decoding fails
-        text = raw_text or ""
-
-    # Try to URL-decode percent-encoding if it looks present
-    try:
-        if "%3C" in text.upper() or "%3E" in text.upper():
-            text = urllib.parse.unquote(text)
-    except Exception:
-        pass
-
-    # Replace comparisons like '<=' to avoid starting an HTML tag
-    text = text.replace("<=", "≤")
-
-    # Escape HTML special characters (ampersand first)
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-
-    return text
-
-
 def send_telegram(text: str, timeout: int = 10) -> bool:
-    """Send text to Telegram safely.
-
-    - Sanitize/normalize the message.
-    - Try with parse_mode='HTML'. If Telegram returns a 400 parse-entities error,
-      retry once without parse_mode to guarantee delivery.
-    - Log diagnostics including original/sanitized text and any byte offset snippets
-      Telegram reports so we can see exactly what the parser saw.
-    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[telegram] Not configured -- printing instead:")
         print(text)
         return False
-
-    original = text
-    safe_text = _prepare_for_telegram(original)
-
-    def _truncate(s, n=400):
-        return (s[:n] + "...") if len(s) > n else s
-
-    print(f"[telegram] Sending (orig={_truncate(original)!r}, safe={_truncate(safe_text)!r})")
-
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=timeout,
         )
-
-        if resp.ok:
-            return True
-
-        # Not OK: parse response for diagnostics
-        body = None
-        try:
-            body = resp.json()
-        except Exception:
-            body = resp.text
-        print(f"[telegram] Send failed: {resp.status_code} {body}")
-
-        # If Telegram specifically complains about parse entities, retry without parse_mode
-        desc = ""
-        try:
-            if isinstance(body, dict):
-                desc = body.get("description", "")
-            else:
-                desc = str(body)
-        except Exception:
-            desc = str(body)
-
-        if resp.status_code == 400 and "parse entities" in desc.lower():
-            try:
-                print("[telegram] Retrying send WITHOUT parse_mode due to entity parse error")
-                resp2 = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                    json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text},
-                    timeout=timeout,
-                )
-                if resp2.ok:
-                    print("[telegram] Retry without parse_mode succeeded")
-                    return True
-                else:
-                    try:
-                        print(f"[telegram] Retry failed: {resp2.status_code} {resp2.json()}")
-                    except Exception:
-                        print(f"[telegram] Retry failed: {resp2.status_code} {resp2.text}")
-            except requests.RequestException as e:
-                print(f"[telegram] Retry without parse_mode failed: {e}")
-
-        # If Telegram reports a byte offset, log the bytes around it from the sanitized text
-        try:
-            m = re.search(r"byte offset (\d+)", desc)
-            if m:
-                off = int(m.group(1))
-                b = safe_text.encode("utf-8", errors="replace")
-                start = max(0, off - 40)
-                end = off + 40
-                snippet = b[start:end]
-                print(f"[telegram] Byte offset reported: {off}. Bytes around offset: {snippet!r}")
-        except Exception as e:
-            print(f"[telegram] Failed to introspect response body for offset: {e}")
-
-        return False
+        if not resp.ok:
+            print(f"[telegram] Send failed: {resp.status_code} {resp.text}")
+        return resp.ok
     except requests.RequestException as e:
         print(f"[telegram] Send failed: {e}")
         return False
 
 
-# rest of file unchanged
-
-def fetch_today_forecast(lat: float, lon: float, timeout: int = 15) -> dict:
+def fetch_today_forecast(lat: float, lon: float, target_date: str, timeout: int = 15) -> dict:
+    """
+    FIX: this previously had no target_date parameter at all -- it called Open-Meteo
+    with forecast_days=1 and blindly took series[0], which is ALWAYS TODAY's
+    forecast, never the actual target_date being evaluated (which is always
+    tomorrow, per run_check). Every corrected forecast this session was computed
+    from today's number and compared against tomorrow's market. Now explicitly
+    fetches enough days to cover target_date and indexes to the matching date.
+    """
     params = {"latitude": lat, "longitude": lon, "daily": "temperature_2m_max",
-              "models": ",".join(MODELS), "timezone": "auto", "forecast_days": 1}
+              "models": ",".join(MODELS), "timezone": "auto", "forecast_days": 3}
     resp = requests.get(OPEN_METEO_BASE, params=params, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     daily = data.get("daily", {})
+    dates = daily.get("time", [])
+    if target_date not in dates:
+        print(f"    [forecast] WARNING: target_date {target_date} not in returned range {dates}")
+        return {m: None for m in MODELS}
+    idx = dates.index(target_date)
     result = {}
     for m in MODELS:
         key = f"temperature_2m_max_{m}"
         series = daily.get(key, daily.get("temperature_2m_max"))
-        result[m] = series[0] if series else None
+        result[m] = series[idx] if series and idx < len(series) else None
     return result
 
 
@@ -226,37 +132,16 @@ def predict_peak_hour_index(lat: float, lon: float, timeout: int = 15):
 
 def get_live_obs_if_in_peak_window(lat: float, lon: float, unit: str):
     """
-    Returns a live temperature reading, CONVERTED to the market's unit (C or F),
-    if we're currently inside the predicted peak hour -- else None.
-    This is the piece that was written on the engine side but never actually
-    connected to a live fetch in the deployed code.
+    DISABLED. Real bug found in production: this engine only ever evaluates
+    TOMORROW's market (target_date = today+1), but this function was reading
+    TODAY's current temperature and using it as a floor on tomorrow's forecast.
+    "What's the temperature right now" has no valid relationship to "what will
+    tomorrow's high be" -- comparing them produced the wave of overconfident,
+    market-disagreeing 100% signals seen in production (Toronto, Amsterdam,
+    Chicago, Seoul all hit this). Disabled until this is rebuilt to only apply
+    when checking a SAME-DAY market, which this engine does not currently do.
     """
-    try:
-        idx, times = predict_peak_hour_index(lat, lon)
-    except requests.RequestException as e:
-        print(f"    [live-obs] peak-hour prediction failed: {e}")
-        return None
-    if idx is None:
-        return None
-
-    peak_time_str = times[idx]
-    peak_dt = dt.datetime.fromisoformat(peak_time_str)
-    now_local = dt.datetime.now()  # naive, but Open-Meteo's "auto" timezone times are also naive-local
-
-    if now_local.date() != peak_dt.date() or now_local.hour != peak_dt.hour:
-        return None  # not currently in the predicted peak hour
-
-    try:
-        temp_c = fetch_current_temperature(lat, lon)
-    except requests.RequestException as e:
-        print(f"    [live-obs] current-temp fetch failed: {e}")
-        return None
-    if temp_c is None:
-        return None
-
-    if unit == "F":
-        return temp_c * 9 / 5 + 32
-    return temp_c
+    return None
 
 
 def format_signal_alert(signal: se.Signal) -> str:
@@ -282,7 +167,7 @@ def run_check(bias_data: dict, target_date: str = None):
         print(f"--- {city} ---")
 
         try:
-            raw_values = fetch_today_forecast(cfg["lat"], cfg["lon"])
+            raw_values = fetch_today_forecast(cfg["lat"], cfg["lon"], target_date)
         except requests.RequestException as e:
             print(f"  Forecast fetch failed: {e}")
             continue
@@ -311,7 +196,7 @@ def run_check(bias_data: dict, target_date: str = None):
             spread_cents, depth_ok = pm.get_spread_and_depth(rb["token_id"])
             buckets.append(se.Bucket(
                 label=rb["label"], low=rb["low"], high=rb["high"], price=rb["price"],
-                token_id=rb["token_id"], outcome=rb["outcome"], market_id=rb.get("market_id"),
+                token_id=rb["token_id"], outcome=rb["outcome"], market_id=rb["market_id"],
                 spread_cents=spread_cents, depth_ok=depth_ok,
             ))
 
