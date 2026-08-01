@@ -1,12 +1,7 @@
 """
 main.py -- consolidated, final version. Ties hindcast + signal_engine +
 polymarket_client together, with the live-observation peak-hour floor actually
-connected end to end (confirmed no "Using live_obs=" fetch ever ran in the old
-logs -- Copilot wrote the engine-side support but never wired the caller).
-
-Modes:
-    python main.py hindcast   -- run the 90-day bias/sigma calibration once
-    python main.py            -- run the live scanning loop
+connected end to end.
 """
 
 import os
@@ -14,6 +9,9 @@ import sys
 import time
 import datetime as dt
 import requests
+import quopri
+import urllib.parse
+import re
 
 import hindcast
 import polymarket_client as pm
@@ -38,7 +36,7 @@ CITIES = {
     "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
                "keyword_variants": ["highest temperature in madrid"]},
     "Milan": {"lat": 45.4642, "lon": 9.1900, "unit": "C",
-              "keyword_variants": ["highest temperature in milan"]},
+               "keyword_variants": ["highest temperature in milan"]},
     "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
                "keyword_variants": ["highest temperature in munich"]},
     "Amsterdam": {"lat": 52.3676, "lon": 4.9041, "unit": "C",
@@ -56,24 +54,133 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
+def _prepare_for_telegram(raw_text: str) -> str:
+    """Normalize and escape text before sending to Telegram.
+
+    Steps (best-effort):
+    - Attempt to decode quoted-printable artifacts.
+    - URL-decode percent-encoding (e.g., %3C) if present.
+    - Replace "<=" with unicode '≤' to avoid raw '<' starting a tag.
+    - Escape &, <, > for HTML parse mode.
+    """
+    text = raw_text or ""
+
+    # Try to decode quoted-printable artifacts
+    try:
+        if "=20" in text or "=\r\n" in text or re.search(r"=[0-9A-Fa-f]{2}", text):
+            decoded = quopri.decodestring(text.encode("utf-8", errors="replace"))
+            text = decoded.decode("utf-8", errors="replace")
+    except Exception:
+        # keep original if decoding fails
+        text = raw_text or ""
+
+    # Try to URL-decode percent-encoding if it looks present
+    try:
+        if "%3C" in text.upper() or "%3E" in text.upper():
+            text = urllib.parse.unquote(text)
+    except Exception:
+        pass
+
+    # Replace comparisons like '<=' to avoid starting an HTML tag
+    text = text.replace("<=", "≤")
+
+    # Escape HTML special characters (ampersand first)
+    text = text.replace("&", "&amp;")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+
+    return text
+
+
 def send_telegram(text: str, timeout: int = 10) -> bool:
+    """Send text to Telegram safely.
+
+    - Sanitize/normalize the message.
+    - Try with parse_mode='HTML'. If Telegram returns a 400 parse-entities error,
+      retry once without parse_mode to guarantee delivery.
+    - Log diagnostics including original/sanitized text and any byte offset snippets
+      Telegram reports so we can see exactly what the parser saw.
+    """
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[telegram] Not configured -- printing instead:")
         print(text)
         return False
+
+    original = text
+    safe_text = _prepare_for_telegram(original)
+
+    def _truncate(s, n=400):
+        return (s[:n] + "...") if len(s) > n else s
+
+    print(f"[telegram] Sending (orig={_truncate(original)!r}, safe={_truncate(safe_text)!r})")
+
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text, "parse_mode": "HTML"},
             timeout=timeout,
         )
-        if not resp.ok:
-            print(f"[telegram] Send failed: {resp.status_code} {resp.text}")
-        return resp.ok
+
+        if resp.ok:
+            return True
+
+        # Not OK: parse response for diagnostics
+        body = None
+        try:
+            body = resp.json()
+        except Exception:
+            body = resp.text
+        print(f"[telegram] Send failed: {resp.status_code} {body}")
+
+        # If Telegram specifically complains about parse entities, retry without parse_mode
+        desc = ""
+        try:
+            if isinstance(body, dict):
+                desc = body.get("description", "")
+            else:
+                desc = str(body)
+        except Exception:
+            desc = str(body)
+
+        if resp.status_code == 400 and "parse entities" in desc.lower():
+            try:
+                print("[telegram] Retrying send WITHOUT parse_mode due to entity parse error")
+                resp2 = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text},
+                    timeout=timeout,
+                )
+                if resp2.ok:
+                    print("[telegram] Retry without parse_mode succeeded")
+                    return True
+                else:
+                    try:
+                        print(f"[telegram] Retry failed: {resp2.status_code} {resp2.json()}")
+                    except Exception:
+                        print(f"[telegram] Retry failed: {resp2.status_code} {resp2.text}")
+            except requests.RequestException as e:
+                print(f"[telegram] Retry without parse_mode failed: {e}")
+
+        # If Telegram reports a byte offset, log the bytes around it from the sanitized text
+        try:
+            m = re.search(r"byte offset (\d+)", desc)
+            if m:
+                off = int(m.group(1))
+                b = safe_text.encode("utf-8", errors="replace")
+                start = max(0, off - 40)
+                end = off + 40
+                snippet = b[start:end]
+                print(f"[telegram] Byte offset reported: {off}. Bytes around offset: {snippet!r}")
+        except Exception as e:
+            print(f"[telegram] Failed to introspect response body for offset: {e}")
+
+        return False
     except requests.RequestException as e:
         print(f"[telegram] Send failed: {e}")
         return False
 
+
+# rest of file unchanged
 
 def fetch_today_forecast(lat: float, lon: float, timeout: int = 15) -> dict:
     params = {"latitude": lat, "longitude": lon, "daily": "temperature_2m_max",
@@ -204,7 +311,7 @@ def run_check(bias_data: dict, target_date: str = None):
             spread_cents, depth_ok = pm.get_spread_and_depth(rb["token_id"])
             buckets.append(se.Bucket(
                 label=rb["label"], low=rb["low"], high=rb["high"], price=rb["price"],
-                token_id=rb["token_id"], outcome=rb["outcome"], market_id=rb["market_id"],
+                token_id=rb["token_id"], outcome=rb["outcome"], market_id=rb.get("market_id"),
                 spread_cents=spread_cents, depth_ok=depth_ok,
             ))
 
