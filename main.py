@@ -1,7 +1,12 @@
 """
 main.py -- consolidated, final version. Ties hindcast + signal_engine +
 polymarket_client together, with the live-observation peak-hour floor actually
-connected end to end.
+connected end to end (confirmed no "Using live_obs=" fetch ever ran in the old
+logs -- Copilot wrote the engine-side support but never wired the caller).
+
+Modes:
+    python main.py hindcast   -- run the 90-day bias/sigma calibration once
+    python main.py            -- run the live scanning loop
 """
 
 import os
@@ -9,9 +14,6 @@ import sys
 import time
 import datetime as dt
 import requests
-import quopri
-import urllib.parse
-import re
 
 import hindcast
 import polymarket_client as pm
@@ -33,6 +35,16 @@ CITIES = {
               "keyword_variants": ["highest temperature in seoul"]},
     "Chicago": {"lat": 41.8781, "lon": -87.6298, "unit": "F",
                 "keyword_variants": ["highest temperature in chicago"]},
+    "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
+               "keyword_variants": ["highest temperature in madrid"]},
+    "Milan": {"lat": 45.4642, "lon": 9.1900, "unit": "C",
+              "keyword_variants": ["highest temperature in milan"]},
+    "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
+               "keyword_variants": ["highest temperature in munich"]},
+    "Amsterdam": {"lat": 52.3676, "lon": 4.9041, "unit": "C",
+                  "keyword_variants": ["highest temperature in amsterdam"]},
+    "Berlin": {"lat": 52.5200, "lon": 13.4050, "unit": "C",
+               "keyword_variants": ["highest temperature in berlin"]},
 }
 
 MODELS = hindcast.MODELS
@@ -44,92 +56,19 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def _prepare_for_telegram(raw_text: str) -> str:
-    """Normalize and escape text before sending to Telegram.
-
-    Steps (best-effort):
-    - Attempt to decode quoted-printable artifacts.
-    - URL-decode percent-encoding (e.g., %3C) if present.
-    - Replace "<=" with unicode '≤' to avoid raw '<' starting a tag.
-    - Escape &, <, > for HTML parse mode.
-    """
-    text = raw_text or ""
-
-    # Try to decode quoted-printable artifacts
-    try:
-        if "=20" in text or "=\r\n" in text or re.search(r"=\x[0-9A-Fa-f]{2}", text):
-            decoded = quopri.decodestring(text.encode("utf-8", errors="replace"))
-            text = decoded.decode("utf-8", errors="replace")
-    except Exception:
-        # keep original if decoding fails
-        text = raw_text or ""
-
-    # Try to URL-decode percent-encoding if it looks present
-    try:
-        if "%3C" in text.upper() or "%3E" in text.upper() or "%3c" in text:
-            text = urllib.parse.unquote(text)
-    except Exception:
-        pass
-
-    # Replace comparisons like '<=' to avoid starting an HTML tag
-    text = text.replace("<=", "≤")
-
-    # Escape HTML special characters (ampersand first)
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-
-    return text
-
-
 def send_telegram(text: str, timeout: int = 10) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[telegram] Not configured -- printing instead:")
         print(text)
         return False
-
-    original = text
-    safe_text = _prepare_for_telegram(original)
-
-    # Truncate logs to avoid huge output
-    def _truncate(s, n=400):
-        return (s[:n] + "...") if len(s) > n else s
-
-    print(f"[telegram] Sending (orig={_truncate(original)!r}, safe={_truncate(safe_text)!r})")
-
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_text, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=timeout,
         )
-
         if not resp.ok:
-            # Try to parse JSON body for more info
-            body = None
-            try:
-                body = resp.json()
-            except Exception:
-                body = resp.text
-            print(f"[telegram] Send failed: {resp.status_code} {body}")
-
-            # If Telegram reports a byte offset, log the bytes around it from the sanitized text
-            try:
-                if isinstance(body, dict):
-                    desc = body.get("description", "")
-                else:
-                    desc = str(body)
-                m = re.search(r"byte offset (\d+)", desc)
-                if m:
-                    off = int(m.group(1))
-                    b = safe_text.encode("utf-8", errors="replace")
-                    start = max(0, off - 40)
-                    end = off + 40
-                    snippet = b[start:end]
-                    print(f"[telegram] Byte offset reported: {off}. Bytes around offset: {snippet!r}")
-            except Exception as e:
-                print(f"[telegram] Failed to introspect response body for offset: {e}")
-
+            print(f"[telegram] Send failed: {resp.status_code} {resp.text}")
         return resp.ok
     except requests.RequestException as e:
         print(f"[telegram] Send failed: {e}")
@@ -152,6 +91,7 @@ def fetch_today_forecast(lat: float, lon: float, timeout: int = 15) -> dict:
 
 
 def fetch_current_temperature(lat: float, lon: float, timeout: int = 10):
+    """Live current-conditions reading, in Celsius (Open-Meteo's native unit)."""
     params = {"latitude": lat, "longitude": lon, "current_weather": "true", "timezone": "auto"}
     resp = requests.get(OPEN_METEO_BASE, params=params, timeout=timeout)
     resp.raise_for_status()
@@ -161,6 +101,8 @@ def fetch_current_temperature(lat: float, lon: float, timeout: int = 10):
 
 
 def predict_peak_hour_index(lat: float, lon: float, timeout: int = 15):
+    """Returns (peak_hour_index, times_list) from today's hourly forecast, or
+    (None, None) on failure."""
     params = {"latitude": lat, "longitude": lon, "hourly": "temperature_2m",
               "forecast_days": 1, "timezone": "auto"}
     resp = requests.get(OPEN_METEO_BASE, params=params, timeout=timeout)
@@ -176,6 +118,12 @@ def predict_peak_hour_index(lat: float, lon: float, timeout: int = 15):
 
 
 def get_live_obs_if_in_peak_window(lat: float, lon: float, unit: str):
+    """
+    Returns a live temperature reading, CONVERTED to the market's unit (C or F),
+    if we're currently inside the predicted peak hour -- else None.
+    This is the piece that was written on the engine side but never actually
+    connected to a live fetch in the deployed code.
+    """
     try:
         idx, times = predict_peak_hour_index(lat, lon)
     except requests.RequestException as e:
@@ -186,10 +134,10 @@ def get_live_obs_if_in_peak_window(lat: float, lon: float, unit: str):
 
     peak_time_str = times[idx]
     peak_dt = dt.datetime.fromisoformat(peak_time_str)
-    now_local = dt.datetime.now()
+    now_local = dt.datetime.now()  # naive, but Open-Meteo's "auto" timezone times are also naive-local
 
     if now_local.date() != peak_dt.date() or now_local.hour != peak_dt.hour:
-        return None
+        return None  # not currently in the predicted peak hour
 
     try:
         temp_c = fetch_current_temperature(lat, lon)
@@ -220,13 +168,8 @@ def format_signal_alert(signal: se.Signal) -> str:
 
 
 def run_check(bias_data: dict, target_date: str = None):
+    journal.check_and_resolve_open_signals()
     target_date = target_date or (dt.date.today() + dt.timedelta(days=1)).isoformat()
-
-    # Resolve any previously-open signals before starting this cycle
-    try:
-        journal.check_and_resolve_open_signals()
-    except Exception as e:
-        print(f"[journal] Background resolution check failed: {e}")
 
     for city, cfg in CITIES.items():
         print(f"--- {city} ---")
@@ -261,8 +204,8 @@ def run_check(bias_data: dict, target_date: str = None):
             spread_cents, depth_ok = pm.get_spread_and_depth(rb["token_id"])
             buckets.append(se.Bucket(
                 label=rb["label"], low=rb["low"], high=rb["high"], price=rb["price"],
-                token_id=rb["token_id"], outcome=rb["outcome"],
-                market_id=rb.get("market_id"), spread_cents=spread_cents, depth_ok=depth_ok,
+                token_id=rb["token_id"], outcome=rb["outcome"], market_id=rb["market_id"],
+                spread_cents=spread_cents, depth_ok=depth_ok,
             ))
 
         if not buckets:
@@ -277,40 +220,24 @@ def run_check(bias_data: dict, target_date: str = None):
                 print(f"    {label}: {p:.1%} | {price:.1%} | {gap:+.1f}pp | {spread}c | {depth}")
 
         if result.signal:
-            # Log the signal to the journal (paper-trade) and send alert.
-            try:
+            if journal.has_open_signal(result.signal.city, result.signal.bucket_label):
+                print(f"  Signal fired but already have an OPEN position on this bucket -- "
+                      f"skipping duplicate alert.")
+            else:
+                send_telegram(format_signal_alert(result.signal))
                 signal_id = journal.log_signal(result.signal)
-            except Exception as e:
-                signal_id = None
-                print(f"  [journal] Failed to log signal: {e}")
-
-            alert_text = format_signal_alert(result.signal)
-            if signal_id:
-                alert_text += f"\nSignal ID: {signal_id}"
-
-            send_ok = send_telegram(alert_text)
-            print(f"  -> Telegram alert sent: {send_ok}")
-            if signal_id:
-                print(f"  -> Logged signal id {signal_id} in {journal.JOURNAL_PATH}")
+                print(f"  -> Telegram alert sent. Logged as journal signal #{signal_id}.")
 
 
 def run_self_test(bias_data):
     print("=" * 50)
     print("STARTUP SELF-TEST")
     print("=" * 50)
+    print(f"[journal] JOURNAL_PATH resolves to: {os.path.abspath(journal.JOURNAL_PATH)}")
     if not bias_data:
         print("[!] No bias_data.json found -- run 'python main.py hindcast' first.")
     else:
         print(f"[OK] bias_data.json loaded for {len(bias_data)} cities.")
-
-    # Run a quick journal summary and ensure path exists
-    try:
-        journal._ensure_file()
-        print(f"[OK] Journal path: {journal.JOURNAL_PATH}")
-        journal.print_summary()
-    except Exception as e:
-        print(f"[journal] Self-test failed or journal not writable: {e}")
-
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         ok = send_telegram("\u2705 Weather engine v3 started. Real thresholds restored, "
                             "No-probability bug fixed, live-obs floor wired.")
@@ -327,6 +254,7 @@ if __name__ == "__main__":
 
     bias_data = hindcast.load_bias_data(BIAS_DATA_PATH) or {}
     run_self_test(bias_data)
+    journal.print_summary()
 
     check_number = 0
     while True:

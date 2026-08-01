@@ -38,6 +38,26 @@ def _ensure_file():
     if not os.path.exists(JOURNAL_PATH):
         with open(JOURNAL_PATH, "w", newline="") as f:
             csv.DictWriter(f, fieldnames=FIELDNAMES).writeheader()
+        print(f"  [journal] Created new journal at: {os.path.abspath(JOURNAL_PATH)}")
+
+
+def has_open_signal(city: str, bucket_label: str) -> bool:
+    """
+    FIX: prevents the exact spam seen in production -- the same signal firing
+    (and sending a new Telegram alert) on every single check cycle. Before
+    logging a new signal, check whether an OPEN entry already exists for this
+    same city+bucket -- if so, it's not a new opportunity, it's the same
+    still-open position being re-detected.
+    """
+    _ensure_file()
+    try:
+        with open(JOURNAL_PATH, "r") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"  [journal] has_open_signal check failed, assuming no open signal: {e}")
+        return False
+    return any(r["status"] == "open" and r["city"] == city and r["bucket_label"] == bucket_label
+               for r in rows)
 
 
 def _next_id() -> str:
@@ -48,7 +68,9 @@ def _next_id() -> str:
 
 
 def log_signal(signal) -> str:
-    """Call this right after a signal fires. Returns the signal_id."""
+    """Call this right after a signal fires. Returns the signal_id, or 'FALLBACK'
+    if the write failed (in which case the full row is printed to stdout so the
+    signal isn't silently lost -- per the diagnostic gap Copilot correctly flagged)."""
     _ensure_file()
     signal_id = _next_id()
     row = {
@@ -67,9 +89,14 @@ def log_signal(signal) -> str:
         "won": "",
         "pnl_usd": "",
     }
-    with open(JOURNAL_PATH, "a", newline="") as f:
-        csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(row)
-    return signal_id
+    try:
+        with open(JOURNAL_PATH, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=FIELDNAMES).writerow(row)
+        return signal_id
+    except Exception as e:
+        print(f"  [journal] FAILED to write to {JOURNAL_PATH}: {e}")
+        print(f"  [journal] FALLBACK -- signal data (not persisted): {row}")
+        return "FALLBACK"
 
 
 def _resolve_one(row: dict) -> dict:

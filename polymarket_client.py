@@ -22,10 +22,14 @@ import requests
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
-_OR_BELOW_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*[CF]?\s*or below", re.IGNORECASE)
-_OR_HIGHER_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*[CF]?\s*or higher", re.IGNORECASE)
+_OR_BELOW_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?\s*or below", re.IGNORECASE)
+_OR_HIGHER_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?\s*or higher", re.IGNORECASE)
 _RANGE_RE = re.compile(r"between\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*°\s*([CF])", re.IGNORECASE)
 _SINGLE_RE = re.compile(r"(?<![\d-])(-?\d+(?:\.\d+)?)\s*°\s*([CF])(?!\w)", re.IGNORECASE)
+
+
+def _f_to_c(val: float) -> float:
+    return (val - 32) * 5 / 9
 
 
 def find_events_by_keywords(keywords: list, timeout: int = 15) -> list:
@@ -70,36 +74,48 @@ def find_matching_event(keywords: list, target_date: str) -> dict:
 
 def parse_bucket_label(label: str):
     """
-    Returns (low, high). None/None edges for open-ended tails.
-
-    FIX: "between 84-85°F" style range buckets were being misparsed by the
-    single-value regex, which matched "-85" as a NEGATIVE 85 (reading the range
-    dash as a minus sign) instead of recognizing "84-85" as a range. This
-    produced impossible bucket bounds (~-85°F on a July day), which silently
-    broke every probability calculation for NYC/Chicago (Yes computed near 0%
-    against the bogus negative range -> No came out near 100% on EVERYTHING).
-    Range format is now checked FIRST and explicitly, before any single-value
-    fallback can misfire on it.
+    Returns (low, high), ALWAYS IN CELSIUS regardless of the label's original
+    unit. This is the fix for the F/C mismatch bug: mu (from Open-Meteo, and
+    from hindcast bias/sigma) is always Celsius, but US-city bucket labels are
+    in Fahrenheit ("78-79°F"). Comparing raw Fahrenheit bounds against a
+    Celsius mu made every US bucket compute ~0% Yes / ~100% No, regardless of
+    the real forecast -- confirmed in production logs for Chicago. Converting
+    at the parsing boundary means every downstream consumer only ever sees
+    Celsius, once, consistently -- no scattered unit logic elsewhere.
     """
     m = _RANGE_RE.search(label)
     if m:
-        low_val, high_val = float(m.group(1)), float(m.group(2))
-        return low_val - 0.5, high_val + 0.5  # e.g. "84-85" -> [83.5, 85.5)
+        low_val, high_val, unit = float(m.group(1)), float(m.group(2)), m.group(3).upper()
+        low, high = low_val - 0.5, high_val + 0.5
+        if unit == "F":
+            low, high = _f_to_c(low), _f_to_c(high)
+        return low, high
 
     m = _OR_BELOW_RE.search(label)
     if m:
         val = float(m.group(1))
-        return None, val + 0.5
+        unit = (m.group(2) or "C").upper()
+        high = val + 0.5
+        if unit == "F":
+            high = _f_to_c(high)
+        return None, high
 
     m = _OR_HIGHER_RE.search(label)
     if m:
         val = float(m.group(1))
-        return val - 0.5, None
+        unit = (m.group(2) or "C").upper()
+        low = val - 0.5
+        if unit == "F":
+            low = _f_to_c(low)
+        return low, None
 
     m = _SINGLE_RE.search(label)
     if m:
-        val = float(m.group(1))
-        return val - 0.5, val + 0.5
+        val, unit = float(m.group(1)), m.group(2).upper()
+        low, high = val - 0.5, val + 0.5
+        if unit == "F":
+            low, high = _f_to_c(low), _f_to_c(high)
+        return low, high
 
     return None
 
