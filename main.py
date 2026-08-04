@@ -25,17 +25,17 @@ CITIES = {
                   "keyword_variants": ["highest temperature in new york", "highest temperature in nyc"]},
     "Toronto": {"lat": 43.6532, "lon": -79.3832, "unit": "C",
                 "keyword_variants": ["highest temperature in toronto"]},
-    "Paris": {"lat": 48.8566, "lon": 2.3522, "unit": "C",
+    "Paris": {"lat": 48.9694, "lon": 2.4414, "unit": "C",  # FIXED: Le Bourget Airport (LFPB), the real resolution station -- was city center (48.8566, 2.3522), ~13km off
               "keyword_variants": ["highest temperature in paris"]},
     "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C",
                   "keyword_variants": ["highest temperature in hong kong"]},
-    "Seoul": {"lat": 37.5665, "lon": 126.9780, "unit": "C",
+    "Seoul": {"lat": 37.4691, "lon": 126.4510, "unit": "C",  # FIXED: Incheon Airport (RKSI), the real resolution station -- was city center (37.5665, 126.9780), ~50km off
               "keyword_variants": ["highest temperature in seoul"]},
     "Chicago": {"lat": 41.8781, "lon": -87.6298, "unit": "F",
                 "keyword_variants": ["highest temperature in chicago"]},
     "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
                "keyword_variants": ["highest temperature in madrid"]},
-    "Milan": {"lat": 45.4642, "lon": 9.1900, "unit": "C",
+    "Milan": {"lat": 45.6306, "lon": 8.7281, "unit": "C",  # FIXED: Malpensa Airport (LIMC) confirmed via real Polymarket rules -- NOT Linate as claimed. Was city center (45.4642, 9.1900), ~45km off (Malpensa is well outside the city)
                "keyword_variants": ["highest temperature in milan"]},
     "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
                "keyword_variants": ["highest temperature in munich"]},
