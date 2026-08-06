@@ -189,7 +189,7 @@ def format_signal_alert(signal: se.Signal) -> str:
         f"Est. probability: {signal.est_prob:.1%}\n"
         f"Market price: {signal.market_price:.1%}\n"
         f"Gap: +{signal.gap_pp}pp\n"
-        f"-- real liquidity checked (spread<=20c, real depth), longshot floor, sanity ceiling all passed."
+                f"-- real liquidity checked (spread<=20c, real depth), longshot floor, sanity ceiling all passed."
     )
 
 
@@ -249,6 +249,10 @@ def run_check(bias_data: dict, target_date: str = None):
             if journal.has_open_signal(result.signal.city, result.signal.bucket_label):
                 print(f"  Signal fired but already have an OPEN position on this bucket -- "
                       f"skipping duplicate alert.")
+            elif journal.open_signal_count_for_city(result.signal.city) >= journal.MAX_OPEN_SIGNALS_PER_CITY:
+                print(f"  Signal fired on a NEW bucket, but {result.signal.city} already has "
+                      f"{journal.MAX_OPEN_SIGNALS_PER_CITY} open position(s) -- skipping to avoid "
+                      f"stacking correlated exposure on sibling buckets (same underlying outcome).")
             else:
                 send_telegram(format_signal_alert(result.signal))
                 signal_id = journal.log_signal(result.signal)

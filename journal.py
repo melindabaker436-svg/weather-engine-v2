@@ -60,6 +60,29 @@ def has_open_signal(city: str, bucket_label: str) -> bool:
                for r in rows)
 
 
+MAX_OPEN_SIGNALS_PER_CITY = 1
+
+
+def open_signal_count_for_city(city: str) -> int:
+    """
+    FIX: addresses "overlapping multi-short bleed" -- multiple DIFFERENT
+    sibling buckets for the same city (e.g. Chicago 76-77F, 75-or-below, and
+    78-79F all firing the same day) previously stacked unlimited correlated
+    exposure on one city's outcome, since has_open_signal() only blocks an
+    EXACT bucket repeating, not a second/third DIFFERENT bucket for the same
+    city. This counts how many open positions already exist for a city so
+    main.py can cap total exposure, not just exact-duplicate exposure.
+    """
+    _ensure_file()
+    try:
+        with open(JOURNAL_PATH, "r") as f:
+            rows = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"  [journal] open_signal_count_for_city check failed, assuming 0: {e}")
+        return 0
+    return sum(1 for r in rows if r["status"] == "open" and r["city"] == city)
+
+
 def _next_id() -> str:
     _ensure_file()
     with open(JOURNAL_PATH, "r") as f:
