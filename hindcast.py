@@ -84,8 +84,12 @@ def fetch_historical_actual_series(lat, lon, days: int, timeout=25):
 
 
 def run_hindcast_for_city(city: str, lat: float, lon: float, days: int = HINDCAST_DAYS):
-    """Returns {model: {"bias": float, "sigma": float, "n": int}} for one city.
-    bias = mean(forecast - actual). Positive = model runs WARM, negative = COLD."""
+    """Returns {model: {"bias": float, "sigma": float, "n": int}} for one city,
+    plus "_typical_model_spread": the average day-to-day disagreement between
+    the 3 models over the hindcast window. Used by the underdispersion filter
+    (signal_engine.check_underdispersion): when TODAY's live inter-model spread
+    is unusually tight relative to this baseline, that's a real, measurable
+    confidence signal, not just a feeling."""
     try:
         actuals = fetch_historical_actual_series(lat, lon, days)
     except requests.RequestException as e:
@@ -93,9 +97,11 @@ def run_hindcast_for_city(city: str, lat: float, lon: float, days: int = HINDCAS
         return {m: {"bias": 0.0, "sigma": 2.5, "n": 0, "note": "actuals fetch failed"} for m in MODELS}
 
     results = {}
+    per_model_forecasts = {}
     for model in MODELS:
         try:
             forecasts = fetch_previous_run_daily_max(lat, lon, model, days)
+            per_model_forecasts[model] = forecasts
         except requests.RequestException as e:
             print(f"  [{city}] {model} fetch failed: {e}")
             results[model] = {"bias": 0.0, "sigma": 2.5, "n": 0, "note": "forecast fetch failed"}
@@ -116,6 +122,15 @@ def run_hindcast_for_city(city: str, lat: float, lon: float, days: int = HINDCAS
         else:
             results[model] = {"bias": 0.0, "sigma": 2.5, "n": len(errors),
                                "note": "insufficient overlapping data, using conservative default"}
+
+    common_dates = set.intersection(*[set(v.keys()) for v in per_model_forecasts.values()]) if per_model_forecasts else set()
+    daily_spreads = []
+    for date in common_dates:
+        vals = [per_model_forecasts[m][date] for m in per_model_forecasts if per_model_forecasts[m].get(date) is not None]
+        if len(vals) >= 2:
+            daily_spreads.append(max(vals) - min(vals))
+    results["_typical_model_spread"] = round(statistics.mean(daily_spreads), 2) if daily_spreads else 2.0
+
     return results
 
 

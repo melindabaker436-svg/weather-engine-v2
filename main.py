@@ -19,7 +19,7 @@ import signal_engine as se
 import journal
 
 CITIES = {
-    "London": {"lat": 51.5074, "lon": -0.1278, "unit": "C",
+    "London": {"lat": 51.5053, "lon": 0.0553, "unit": "C",  # FIXED: London City Airport (EGLC), the real resolution station -- was city center (51.5074, -0.1278). Note the sign flip on longitude (EGLC is EAST of the prime meridian, in the Royal Docks)
                "keyword_variants": ["highest temperature in london"]},
     "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F",
                   "keyword_variants": ["highest temperature in new york", "highest temperature in nyc"]},
