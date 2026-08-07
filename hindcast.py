@@ -140,9 +140,24 @@ def run_full_hindcast(cities: dict, days: int = HINDCAST_DAYS, out_path: str = "
     for city, cfg in cities.items():
         print(f"\n--- {city} ---")
         result = run_hindcast_for_city(city, cfg["lat"], cfg["lon"], days)
-        for model, stats in result.items():
+
+        # Print model-specific stats in the canonical MODELS order to avoid
+        # accidentally iterating over summary keys (which may be non-dict values).
+        for model in MODELS:
+            stats = result.get(model)
+            if not isinstance(stats, dict):
+                # Defensive: if something unexpected is present, print it plainly.
+                print(f"  {model}: {stats}")
+                continue
             note = f" ({stats['note']})" if "note" in stats else ""
             print(f"  {model}: bias={stats['bias']:+.2f}, sigma={stats['sigma']:.2f}, n={stats['n']}{note}")
+
+        # Print any additional summary keys (e.g. _typical_model_spread) separately.
+        for key, val in result.items():
+            if key in MODELS:
+                continue
+            print(f"  {key}: {val}")
+
         all_results[city] = result
 
     with open(out_path, "w") as f:
