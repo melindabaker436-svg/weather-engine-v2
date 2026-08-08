@@ -19,7 +19,7 @@ import signal_engine as se
 import journal
 
 CITIES = {
-    "London": {"lat": 51.5053, "lon": 0.0553, "unit": "C",  # FIXED: London City Airport (EGLC), the real resolution station -- was city center (51.5074, -0.1278). Note the sign flip on longitude (EGLC is EAST of the prime meridian, in the Royal Docks)
+    "London": {"lat": 51.5053, "lon": 0.0553, "unit": "C",  # FIXED: London City Airport (EGLC), the real resolution station -- was city center (51.5074, -0.1278). Note the sign flip on longitude [...]
                "keyword_variants": ["highest temperature in london"]},
     "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F",
                   "keyword_variants": ["highest temperature in new york", "highest temperature in nyc"]},
@@ -35,7 +35,7 @@ CITIES = {
                 "keyword_variants": ["highest temperature in chicago"]},
     "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
                "keyword_variants": ["highest temperature in madrid"]},
-    "Milan": {"lat": 45.6306, "lon": 8.7281, "unit": "C",  # FIXED: Malpensa Airport (LIMC) confirmed via real Polymarket rules -- NOT Linate as claimed. Was city center (45.4642, 9.1900), ~45km off (Malpensa is well outside the city)
+    "Milan": {"lat": 45.6306, "lon": 8.7281, "unit": "C",  # FIXED: Malpensa Airport (LIMC) confirmed via real Polymarket rules -- NOT Linate as claimed. Was city center (45.4642, 9.1900), ~45km o[...]
                "keyword_variants": ["highest temperature in milan"]},
     "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
                "keyword_variants": ["highest temperature in munich"]},
@@ -50,8 +50,19 @@ OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 BIAS_DATA_PATH = "./bias_data.json"
 CHECK_INTERVAL_MINUTES = 10
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Accept multiple environment variable names for flexibility in deployments
+TELEGRAM_BOT_TOKEN = (
+    os.environ.get("TELEGRAM_BOT_TOKEN")
+    or os.environ.get("TG_BOT_TOKEN")
+    or os.environ.get("BOT_TOKEN")
+    or ""
+)
+TELEGRAM_CHAT_ID = (
+    os.environ.get("TELEGRAM_CHAT_ID")
+    or os.environ.get("TG_CHAT_ID")
+    or os.environ.get("TELEGRAM_CHAT")
+    or ""
+)
 
 
 def _prepare_for_telegram(raw_text: str) -> str:
@@ -83,6 +94,24 @@ def _prepare_for_telegram(raw_text: str) -> str:
     return text
 
 
+def _telegram_configured() -> bool:
+    return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def _check_telegram_connectivity(timeout: int = 6) -> None:
+    if not _telegram_configured():
+        print("[telegram] Not configured. Expected env vars: TELEGRAM_BOT_TOKEN (or TG_BOT_TOKEN) and TELEGRAM_CHAT_ID (or TG_CHAT_ID). Alerts will print to console.")
+        return
+    try:
+        resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe", timeout=timeout)
+        if resp.ok:
+            print(f"[telegram] getMe OK: {resp.json().get('result', {}).get('username')}")
+        else:
+            print(f"[telegram] getMe failed: {resp.status_code} {resp.text}")
+    except requests.RequestException as e:
+        print(f"[telegram] Connectivity check failed: {e}")
+
+
 def send_telegram(text: str, timeout: int = 10) -> bool:
     """Emergency: always send WITHOUT parse_mode to guarantee delivery.
 
@@ -109,6 +138,8 @@ def send_telegram(text: str, timeout: int = 10) -> bool:
         )
         if not resp.ok:
             print(f"[telegram] Send failed: {resp.status_code} {resp.text}")
+        else:
+            print(f"[telegram] Send OK: {resp.status_code}")
         return resp.ok
     except requests.RequestException as e:
         print(f"[telegram] Send failed: {e}")
@@ -254,9 +285,14 @@ def run_check(bias_data: dict, target_date: str = None):
                       f"{journal.MAX_OPEN_SIGNALS_PER_CITY} open position(s) -- skipping to avoid "
                       f"stacking correlated exposure on sibling buckets (same underlying outcome).")
             else:
-                send_telegram(format_signal_alert(result.signal))
+                # Added connectivity/check prints so failures are visible in logs
+                print("  -> Attempting to send Telegram alert...")
+                ok = send_telegram(format_signal_alert(result.signal))
                 signal_id = journal.log_signal(result.signal)
-                print(f"  -> Telegram alert sent. Logged as journal signal #{signal_id}.")
+                if ok:
+                    print(f"  -> Telegram alert sent. Logged as journal signal #{signal_id}.")
+                else:
+                    print(f"  -> Telegram alert NOT sent (see logs). Logged as journal signal #{signal_id}.")
 
 
 def run_self_test(bias_data):
@@ -268,12 +304,7 @@ def run_self_test(bias_data):
         print("[!] No bias_data.json found -- run 'python main.py hindcast' first.")
     else:
         print(f"[OK] bias_data.json loaded for {len(bias_data)} cities.")
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        ok = send_telegram("\u2705 Weather engine v3 started. Real thresholds restored, "
-                            "No-probability bug fixed, live-obs floor wired.")
-        print(f"[{'OK' if ok else 'FAIL'}] Telegram")
-    else:
-        print("[!] Telegram not configured -- alerts print to console.")
+    _check_telegram_connectivity()
     print("=" * 50)
 
 
