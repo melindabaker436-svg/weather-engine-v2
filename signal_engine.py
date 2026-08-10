@@ -210,6 +210,12 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
         and best_bucket.low <= mu <= best_bucket.high
     )
 
+    if near_boundary_risk:
+        return EvalResult(None, "near_boundary_no",
+                           f"Rejected No on '{best_bucket.label}' — model mean ({mu:.2f}) "
+                           f"sits inside the shorted bucket. High historical loss rate.",
+                           candidate_table)
+
     stake = calc_kelly_stake(best_prob, best_bucket.price)
     if stake <= 0:
         return EvalResult(None, "kelly_stake_zero",
