@@ -145,15 +145,7 @@ def calc_kelly_stake(p: float, price: float, kelly_fraction: float = KELLY_FRACT
 
 
 def _bucket_est_prob(bucket: Bucket, mu: float, sigma: float) -> float:
-    """Yes = the real Gaussian mass in [low, high). No = 1 - Yes for the SAME
-    range -- fixes the production bug where both showed the same number."""
-    yes_prob = prob_math.bucket_probability(bucket.low, bucket.high, mu, sigma)
-    if bucket.outcome == "No":
-        return 1.0 - yes_prob
-    return yes_prob
-    """Yes = the real Gaussian mass in [low, high). No = 1 - Yes for the SAME
-    range -- this is the fix for the production bug where both showed the same
-    number."""
+    """Yes = the real Gaussian mass in [low, high). No = 1 - Yes for the SAME range."""
     yes_prob = prob_math.bucket_probability(bucket.low, bucket.high, mu, sigma)
     if bucket.outcome == "No":
         return 1.0 - yes_prob
