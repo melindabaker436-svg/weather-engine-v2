@@ -26,7 +26,7 @@ NOMINAL_STAKE_USD = 30.0
 
 FIELDNAMES = [
     "signal_id", "logged_at_utc", "city", "bucket_label", "outcome",
-    "token_id", "market_id", "entry_price", "est_prob", "gap_pp",
+    "token_id", "market_id", "entry_price", "stake_usd", "est_prob", "gap_pp",
     "status", "resolved_at_utc", "won", "pnl_usd",
 ]
 
@@ -105,6 +105,7 @@ def log_signal(signal) -> str:
         "token_id": signal.token_id or "",
         "market_id": signal.market_id or "",
         "entry_price": signal.market_price,
+        "stake_usd": signal.suggested_stake,
         "est_prob": signal.est_prob,
         "gap_pp": signal.gap_pp,
         "status": "open",
@@ -156,7 +157,7 @@ def _resolve_one(row: dict) -> dict:
 
     won = final_price >= 0.5  # resolved outcomes settle to ~1.0 (won) or ~0.0 (lost)
     entry_price = float(row["entry_price"])
-    stake = NOMINAL_STAKE_USD
+    stake = float(row.get("stake_usd") or NOMINAL_STAKE_USD)  # use the real Kelly-sized stake logged with this trade
 
     if won:
         shares = stake / entry_price if entry_price > 0 else 0

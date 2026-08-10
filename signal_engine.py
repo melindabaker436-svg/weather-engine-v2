@@ -19,6 +19,10 @@ import prob_math
 
 LONGSHOT_FLOOR = 0.10
 MAX_SANITY_GAP_PP = 45
+KELLY_FRACTION = 0.25          # quarter-Kelly, standard conservative fraction
+NOMINAL_BANKROLL_USD = 1000.0  # paper bankroll baseline -- no real orders placed
+MAX_STAKE_USD = 50.0           # hard cap regardless of what Kelly suggests
+MIN_STAKE_USD = 10.0           # floor -- below this, not worth the trade/fees
 MIN_GAP_PP = 12
 MAX_SPREAD_CENTS = 20
 
@@ -55,6 +59,7 @@ class Signal:
     market_id: Optional[str] = None
     outcome: str = "Yes"
     near_boundary_risk: bool = False
+    suggested_stake: float = 30.0
 
 
 @dataclass
@@ -119,7 +124,33 @@ def correct_forecast(raw_model_values: dict, bias_data: dict, live_obs: float = 
     return mu, sigma, used_live_obs, underdispersed
 
 
+def calc_kelly_stake(p: float, price: float, kelly_fraction: float = KELLY_FRACTION) -> float:
+    """
+    Fractional Kelly sizing. b = payout odds per dollar risked (buying at `price`,
+    paying out $1 if correct). f* = (p*b - (1-p)) / b is full Kelly; we take a
+    fraction of that (0.25 = quarter-Kelly, the standard conservative default
+    real documented bots use, confirmed via public bot writeups this session).
+    Returns a dollar stake, capped at MAX_STAKE_USD and floored at MIN_STAKE_USD
+    (returns 0 if the edge is too small to bother with fees/slippage).
+    """
+    if price <= 0 or price >= 1:
+        return 0.0
+    b = (1.0 - price) / price
+    full_kelly = (p * b - (1 - p)) / b
+    if full_kelly <= 0:
+        return 0.0
+    stake = full_kelly * kelly_fraction * NOMINAL_BANKROLL_USD
+    stake = min(stake, MAX_STAKE_USD)
+    return round(stake, 2) if stake >= MIN_STAKE_USD else 0.0
+
+
 def _bucket_est_prob(bucket: Bucket, mu: float, sigma: float) -> float:
+    """Yes = the real Gaussian mass in [low, high). No = 1 - Yes for the SAME
+    range -- fixes the production bug where both showed the same number."""
+    yes_prob = prob_math.bucket_probability(bucket.low, bucket.high, mu, sigma)
+    if bucket.outcome == "No":
+        return 1.0 - yes_prob
+    return yes_prob
     """Yes = the real Gaussian mass in [low, high). No = 1 - Yes for the SAME
     range -- this is the fix for the production bug where both showed the same
     number."""
@@ -187,13 +218,20 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
         and best_bucket.low <= mu <= best_bucket.high
     )
 
+    stake = calc_kelly_stake(best_prob, best_bucket.price)
+    if stake <= 0:
+        return EvalResult(None, "kelly_stake_zero",
+                           f"Edge on '{best_bucket.label}' didn't clear Kelly sizing threshold "
+                           f"(est={best_prob:.1%}, price={best_bucket.price:.1%}) -- skipped.",
+                           candidate_table)
+
     sig = Signal(
         city=city, bucket_label=best_bucket.label, corrected_mu=round(mu, 2),
         sigma=round(sigma, 2), est_prob=round(best_prob, 4),
         market_price=best_bucket.price, gap_pp=best_gap, models_used=models_used,
         used_live_obs=used_live_obs, underdispersed=underdispersed, token_id=best_bucket.token_id,
         market_id=best_bucket.market_id, outcome=best_bucket.outcome,
-        near_boundary_risk=near_boundary_risk,
+        near_boundary_risk=near_boundary_risk, suggested_stake=stake,
     )
     return EvalResult(sig, "fired",
                        f"Signal: '{best_bucket.label}' est {best_prob:.1%} vs market "
