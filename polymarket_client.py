@@ -24,7 +24,10 @@ CLOB_BASE = "https://clob.polymarket.com"
 
 _OR_BELOW_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?\s*or below", re.IGNORECASE)
 _OR_HIGHER_RE = re.compile(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])?\s*or higher", re.IGNORECASE)
-_RANGE_RE = re.compile(r"between\s+(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*°\s*([CF])", re.IGNORECASE)
+_RANGE_RE = re.compile(
+    r"(?:between\s+)?(-?\d+(?:\.\d+)?)\s*[-–]\s*"
+    r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])", re.IGNORECASE
+)
 _SINGLE_RE = re.compile(r"(?<![\d-])(-?\d+(?:\.\d+)?)\s*°\s*([CF])(?!\w)", re.IGNORECASE)
 
 
