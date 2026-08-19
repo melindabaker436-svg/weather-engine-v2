@@ -21,10 +21,13 @@ LONGSHOT_FLOOR = 0.10
 MAX_SANITY_GAP_PP = 45
 KELLY_FRACTION = 0.25          # quarter-Kelly, standard conservative fraction
 NOMINAL_BANKROLL_USD = 1000.0  # paper bankroll baseline -- no real orders placed
-MAX_STAKE_USD = 50.0           # hard cap regardless of what Kelly suggests
-MIN_STAKE_USD = 10.0           # floor -- below this, not worth the trade/fees
-MIN_GAP_PP = 12
+MAX_STAKE_USD = 5.0            # calibration phase: paper exposure only
+MIN_STAKE_USD = 1.0            # calibration phase: keep small observations alive
+MIN_GAP_PP = 15
 MAX_SPREAD_CENTS = 20
+MAX_YES_PRICE = 0.22           # only test genuinely cheap Yes contracts
+MAX_NO_PRICE = 0.65             # avoid expensive No's with poor upside
+MIN_YES_PROB = 0.20             # cheap Yes still needs meaningful probability
 
 PEAK_SIGMA_REDUCTION_FACTOR = 0.5
 MIN_SIGMA = 0.25
@@ -178,6 +181,13 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
         and c[0].spread_cents is not None
         and c[0].spread_cents <= MAX_SPREAD_CENTS
         and c[0].depth_ok is True
+        and (
+            (c[0].outcome == "Yes"
+             and c[0].price <= MAX_YES_PRICE
+             and c[1] >= MIN_YES_PROB)
+            or
+            (c[0].outcome == "No" and c[0].price <= MAX_NO_PRICE)
+        )
     ]
 
     if not real_candidates:
@@ -216,6 +226,8 @@ def evaluate_buckets(city: str, raw_model_values: dict, bias_data: dict,
                            f"sits inside the shorted bucket. High historical loss rate.",
                            candidate_table)
 
+    # During calibration, a signal is an observation—not a reason to scale up.
+    # Keep the Kelly calculation visible, but cap the paper stake at $5.
     stake = calc_kelly_stake(best_prob, best_bucket.price)
     if stake <= 0:
         return EvalResult(None, "kelly_stake_zero",

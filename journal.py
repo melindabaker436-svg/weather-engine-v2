@@ -17,12 +17,13 @@ or this P&L history will vanish on the next push.
 """
 
 import csv
+import math
 import os
 import datetime as dt
 import polymarket_client as pm
 
 JOURNAL_PATH = os.environ.get("JOURNAL_PATH", "./journal.csv")
-NOMINAL_STAKE_USD = 30.0
+NOMINAL_STAKE_USD = 5.0
 
 FIELDNAMES = [
     "signal_id", "logged_at_utc", "city", "bucket_label", "outcome",
@@ -205,6 +206,22 @@ def compute_summary() -> dict:
     wins = [r for r in resolved if r["won"] == "Yes"]
     total_pnl = sum(float(r["pnl_usd"]) for r in resolved) if resolved else 0.0
     win_rate = len(wins) / len(resolved) if resolved else 0.0
+    scored = []
+    for row in resolved:
+        try:
+            p = min(max(float(row["est_prob"]), 1e-6), 1 - 1e-6)
+            y = 1.0 if row["won"] == "Yes" else 0.0
+            scored.append((p, y))
+        except (KeyError, TypeError, ValueError):
+            continue
+    brier_score = (
+        sum((p - y) ** 2 for p, y in scored) / len(scored)
+        if scored else None
+    )
+    log_loss = (
+        sum(-(y * math.log(p) + (1 - y) * math.log(1 - p)) for p, y in scored) / len(scored)
+        if scored else None
+    )
 
     return {
         "total_signals": len(rows),
@@ -214,13 +231,15 @@ def compute_summary() -> dict:
         "losses": len(resolved) - len(wins),
         "win_rate_pct": round(win_rate * 100, 1),
         "total_pnl_usd": round(total_pnl, 2),
+        "brier_score": round(brier_score, 4) if brier_score is not None else None,
+        "log_loss": round(log_loss, 4) if log_loss is not None else None,
     }
 
 
 def print_summary():
     s = compute_summary()
     print("=" * 50)
-    print("P&L SUMMARY (nominal $%.0f stake per signal, no real orders placed)" % NOMINAL_STAKE_USD)
+    print("P&L SUMMARY (calibration paper stake $%.0f per signal, no real orders placed)" % NOMINAL_STAKE_USD)
     print("=" * 50)
     for k, v in s.items():
         print(f"  {k}: {v}")
