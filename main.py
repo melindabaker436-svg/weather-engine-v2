@@ -21,27 +21,36 @@ import journal
 CITIES = {
     "London": {"lat": 51.5053, "lon": 0.0553, "unit": "C",  # FIXED: London City Airport (EGLC), the real resolution station -- was city center (51.5074, -0.1278). Note the sign flip on longitude (EGLC is EAST of the prime meridian, in the Royal Docks)
                "keyword_variants": ["highest temperature in london"]},
-    "New York": {"lat": 40.7128, "lon": -74.0060, "unit": "F",
+    # Polymarket resolves NYC at LaGuardia (KLGA), not Manhattan.
+    "New York": {"lat": 40.7772, "lon": -73.8726, "unit": "F",
                   "keyword_variants": ["highest temperature in new york", "highest temperature in nyc"]},
-    "Toronto": {"lat": 43.6532, "lon": -79.3832, "unit": "C",
+    # Polymarket resolves Toronto at Toronto Pearson (CYYZ).
+    "Toronto": {"lat": 43.6777, "lon": -79.6248, "unit": "C",
                 "keyword_variants": ["highest temperature in toronto"]},
     "Paris": {"lat": 48.9694, "lon": 2.4414, "unit": "C",  # FIXED: Le Bourget Airport (LFPB), the real resolution station -- was city center (48.8566, 2.3522), ~13km off
               "keyword_variants": ["highest temperature in paris"]},
-    "Hong Kong": {"lat": 22.3193, "lon": 114.1694, "unit": "C",
+    # The market uses the Hong Kong Observatory series. This is a proxy for
+    # the Observatory, not a generic Hong Kong city-centre forecast.
+    "Hong Kong": {"lat": 22.3027, "lon": 114.1747, "unit": "C",
                   "keyword_variants": ["highest temperature in hong kong"]},
     "Seoul": {"lat": 37.4691, "lon": 126.4510, "unit": "C",  # FIXED: Incheon Airport (RKSI), the real resolution station -- was city center (37.5665, 126.9780), ~50km off
               "keyword_variants": ["highest temperature in seoul"]},
-    "Chicago": {"lat": 41.8781, "lon": -87.6298, "unit": "F",
+    # Polymarket resolves Chicago at O'Hare (KORD), not downtown Chicago.
+    "Chicago": {"lat": 41.9742, "lon": -87.9073, "unit": "F",
                 "keyword_variants": ["highest temperature in chicago"]},
-    "Madrid": {"lat": 40.4168, "lon": -3.7038, "unit": "C",
+    # Polymarket resolves Madrid at Adolfo Suárez Madrid-Barajas (LEMD).
+    "Madrid": {"lat": 40.4936, "lon": -3.5668, "unit": "C",
                "keyword_variants": ["highest temperature in madrid"]},
     "Milan": {"lat": 45.6306, "lon": 8.7281, "unit": "C",  # FIXED: Malpensa Airport (LIMC) confirmed via real Polymarket rules -- NOT Linate as claimed. Was city center (45.4642, 9.1900), ~45km off (Malpensa is well outside the city)
                "keyword_variants": ["highest temperature in milan"]},
-    "Munich": {"lat": 48.1351, "lon": 11.5820, "unit": "C",
+    # Polymarket resolves Munich at Munich Airport (EDDM).
+    "Munich": {"lat": 48.3538, "lon": 11.7861, "unit": "C",
                "keyword_variants": ["highest temperature in munich"]},
-    "Amsterdam": {"lat": 52.3676, "lon": 4.9041, "unit": "C",
+    # Polymarket resolves Amsterdam at Schiphol (EHAM).
+    "Amsterdam": {"lat": 52.3105, "lon": 4.7683, "unit": "C",
                   "keyword_variants": ["highest temperature in amsterdam"]},
-    "Berlin": {"lat": 52.5200, "lon": 13.4050, "unit": "C",
+    # Polymarket resolves Berlin at Berlin Brandenburg (EDDB).
+    "Berlin": {"lat": 52.3667, "lon": 13.5033, "unit": "C",
                "keyword_variants": ["highest temperature in berlin"]},
 }
 
