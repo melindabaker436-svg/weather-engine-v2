@@ -22,7 +22,7 @@ import datetime as dt
 import polymarket_client as pm
 
 JOURNAL_PATH = os.environ.get("JOURNAL_PATH", "./journal.csv")
-NOMINAL_STAKE_USD = 30.0
+NOMINAL_STAKE_USD = 5.0
 
 FIELDNAMES = [
     "signal_id", "logged_at_utc", "city", "bucket_label", "outcome",
@@ -220,7 +220,7 @@ def compute_summary() -> dict:
 def print_summary():
     s = compute_summary()
     print("=" * 50)
-    print("P&L SUMMARY (nominal $%.0f stake per signal, no real orders placed)" % NOMINAL_STAKE_USD)
+    print("P&L SUMMARY (calibration paper stake $%.0f per signal, no real orders placed)" % NOMINAL_STAKE_USD)
     print("=" * 50)
     for k, v in s.items():
         print(f"  {k}: {v}")
