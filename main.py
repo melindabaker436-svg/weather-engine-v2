@@ -198,7 +198,7 @@ def format_signal_alert(signal: se.Signal) -> str:
         f"Est. probability: {signal.est_prob:.1%}\n"
         f"Market price: {signal.market_price:.1%}\n"
         f"Gap: +{signal.gap_pp}pp\n"
-        f"Suggested stake: ${signal.suggested_stake} (quarter-Kelly, capped at $50)\n"
+        f"Suggested paper stake: ${signal.suggested_stake} (calibration cap: $5)\n"
                 f"-- real liquidity checked (spread<=20c, real depth), longshot floor, sanity ceiling all passed."
     )
 
