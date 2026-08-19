@@ -57,7 +57,10 @@ CITIES = {
 MODELS = hindcast.MODELS
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
 BIAS_DATA_PATH = os.environ.get("BIAS_DATA_PATH", "./bias_data.json")
-CHECK_INTERVAL_MINUTES = 10
+CHECK_INTERVAL_MINUTES = 30
+FORECAST_CACHE_TTL_SECONDS = 30 * 60
+OPEN_METEO_BACKOFF_UNTIL = 0
+FORECAST_CACHE = {}
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -125,16 +128,23 @@ def send_telegram(text: str, timeout: int = 10) -> bool:
 
 
 def fetch_today_forecast(lat: float, lon: float, target_date: str, timeout: int = 15) -> dict:
-    """
-    FIX: this previously had no target_date parameter at all -- it called Open-Meteo
-    with forecast_days=1 and blindly took series[0], which is ALWAYS TODAY's
-    forecast, never the actual target_date being evaluated (which is always
-    tomorrow, per run_check). Now explicitly fetches enough days to cover target_date
-    and indexes to the matching date.
-    """
+    """Fetch a target-date forecast with a short cache and 429 backoff."""
+    global OPEN_METEO_BACKOFF_UNTIL
+    cache_key = (round(lat, 4), round(lon, 4), target_date)
+    cached = FORECAST_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached["stored_at"] < FORECAST_CACHE_TTL_SECONDS:
+        return cached["values"]
+    if now < OPEN_METEO_BACKOFF_UNTIL:
+        raise requests.HTTPError("Open-Meteo rate-limit cooldown is active")
+
     params = {"latitude": lat, "longitude": lon, "daily": "temperature_2m_max",
               "models": ",".join(MODELS), "timezone": "auto", "forecast_days": 3}
     resp = requests.get(OPEN_METEO_BASE, params=params, timeout=timeout)
+    if resp.status_code == 429:
+        retry_after = int(resp.headers.get("Retry-After", "1800")) if resp.headers.get("Retry-After", "1800").isdigit() else 1800
+        OPEN_METEO_BACKOFF_UNTIL = time.time() + max(retry_after, 1800)
+        resp.raise_for_status()
     resp.raise_for_status()
     data = resp.json()
     daily = data.get("daily", {})
@@ -148,6 +158,7 @@ def fetch_today_forecast(lat: float, lon: float, target_date: str, timeout: int 
         key = f"temperature_2m_max_{m}"
         series = daily.get(key, daily.get("temperature_2m_max"))
         result[m] = series[idx] if series and idx < len(series) else None
+    FORECAST_CACHE[cache_key] = {"stored_at": time.time(), "values": result}
     return result
 
 
@@ -212,6 +223,12 @@ def run_check(bias_data: dict, target_date: str = None):
 
         try:
             raw_values = fetch_today_forecast(cfg["lat"], cfg["lon"], target_date)
+        except requests.HTTPError as e:
+            if "429" in str(e) or "rate-limit cooldown" in str(e):
+                print(f"  Open-Meteo rate limit reached; stopping this check cycle: {e}")
+                return
+            print(f"  Forecast fetch failed: {e}")
+            continue
         except requests.RequestException as e:
             print(f"  Forecast fetch failed: {e}")
             continue
