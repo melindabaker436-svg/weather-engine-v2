@@ -56,7 +56,7 @@ CITIES = {
 
 MODELS = hindcast.MODELS
 OPEN_METEO_BASE = "https://api.open-meteo.com/v1/forecast"
-BIAS_DATA_PATH = "./bias_data.json"
+BIAS_DATA_PATH = os.environ.get("BIAS_DATA_PATH", "./bias_data.json")
 CHECK_INTERVAL_MINUTES = 10
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
