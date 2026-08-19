@@ -160,9 +160,11 @@ def run_full_hindcast(cities: dict, days: int = HINDCAST_DAYS, out_path: str = "
 
         all_results[city] = result
 
-    with open(out_path, "w") as f:
+    output_path = os.path.abspath(out_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
         json.dump({"generated": dt.datetime.utcnow().isoformat(), "data": all_results}, f, indent=2)
-    print(f"\nSaved to {out_path}")
+    print(f"\nSaved hindcast data to {output_path}")
     return all_results
 
 

@@ -274,8 +274,10 @@ def run_self_test(bias_data):
     print("STARTUP SELF-TEST")
     print("=" * 50)
     print(f"[journal] JOURNAL_PATH resolves to: {os.path.abspath(journal.JOURNAL_PATH)}")
+    print(f"[config] BIAS_DATA_PATH resolves to: {os.path.abspath(BIAS_DATA_PATH)}")
     if not bias_data:
-        print("[!] No bias_data.json found -- run 'python main.py hindcast' first.")
+        print(f"[!] Hindcast data is missing or invalid at {os.path.abspath(BIAS_DATA_PATH)}.")
+        print("    Run 'python main.py hindcast' once after attaching persistent storage.")
     else:
         print(f"[OK] bias_data.json loaded for {len(bias_data)} cities.")
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
